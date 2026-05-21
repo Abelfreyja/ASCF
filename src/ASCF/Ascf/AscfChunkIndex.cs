@@ -13,6 +13,12 @@ public sealed class AscfChunkIndex
         ValidateOrderedEntries(_entries);
     }
 
+    internal AscfChunkIndex(AscfChunkIndexEntry[] entries)
+    {
+        _entries = entries;
+        ValidateOrderedEntries(_entries);
+    }
+
     /// <summary> The entries in file order. </summary>
     public IReadOnlyList<AscfChunkIndexEntry> Entries => _entries;
 
