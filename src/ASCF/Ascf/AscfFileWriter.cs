@@ -622,9 +622,17 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
-        var index = AscfChunkIndexCodec.WriteIndex(entries);
-        var footer = AscfChunkIndexCodec.WriteFooter(entries.Count, rawSize, indexOffset, index);
-        await WriteBytesAsync(destination, index, options, token).ConfigureAwait(false);
+        var entryBuffer = new byte[AscfFileFormat.IndexEntrySize];
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        foreach (var entry in entries)
+        {
+            AscfChunkIndexCodec.WriteEntry(entryBuffer, entry);
+            indexChecksum.Append(entryBuffer);
+            await WriteBytesAsync(destination, entryBuffer, options, token).ConfigureAwait(false);
+        }
+
+        var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
+        var footer = AscfChunkIndexCodec.WriteFooter(entries.Count, rawSize, indexOffset, indexLength, indexChecksum.GetCurrentHashAsUInt64());
         await WriteBytesAsync(destination, footer, options, token).ConfigureAwait(false);
     }
 

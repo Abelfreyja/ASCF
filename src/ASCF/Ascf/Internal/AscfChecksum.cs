@@ -5,6 +5,9 @@ namespace ASCF;
 
 internal static class AscfChecksum
 {
+    public static XxHash3 CreateIncrementalXxHash3()
+        => new();
+
     public static ulong ComputeXxHash3(ReadOnlySpan<byte> data)
         => XxHash3.HashToUInt64(data);
 

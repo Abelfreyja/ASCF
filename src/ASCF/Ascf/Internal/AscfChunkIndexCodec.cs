@@ -66,16 +66,6 @@ internal static class AscfChunkIndexCodec
     //             | footer checksum              | u64
     //      +0x40  +------------------------------+
     //
-    public static byte[] WriteIndex(IReadOnlyList<AscfChunkIndexEntry> entries)
-    {
-        var index = new byte[checked(entries.Count * AscfFileFormat.IndexEntrySize)];
-        for (var i = 0; i < entries.Count; i++)
-        {
-            WriteEntry(index.AsSpan(i * AscfFileFormat.IndexEntrySize, AscfFileFormat.IndexEntrySize), entries[i]);
-        }
-
-        return index;
-    }
 
     public static AscfChunkIndex ReadIndex(ReadOnlySpan<byte> index, AscfIndexFooter footer)
     {
@@ -99,7 +89,7 @@ internal static class AscfChunkIndexCodec
         return new AscfChunkIndex(entries);
     }
 
-    public static byte[] WriteFooter(int chunkCount, long rawSize, long indexOffset, ReadOnlySpan<byte> index)
+    public static byte[] WriteFooter(int chunkCount, long rawSize, long indexOffset, long indexLength, ulong indexChecksum)
     {
         var footer = new byte[AscfFileFormat.IndexFooterSize];
         footer.AsSpan().Clear();
@@ -110,8 +100,8 @@ internal static class AscfChunkIndexCodec
         BinaryPrimitives.WriteInt32LittleEndian(footer.AsSpan(0x10), chunkCount);
         BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0x18), rawSize);
         BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0x20), indexOffset);
-        BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0x28), index.Length);
-        BinaryPrimitives.WriteUInt64LittleEndian(footer.AsSpan(0x30), AscfChecksum.ComputeXxHash3(index));
+        BinaryPrimitives.WriteInt64LittleEndian(footer.AsSpan(0x28), indexLength);
+        BinaryPrimitives.WriteUInt64LittleEndian(footer.AsSpan(0x30), indexChecksum);
         BinaryPrimitives.WriteUInt64LittleEndian(footer.AsSpan(0x38), ComputeFooterChecksum(footer));
         return footer;
     }
@@ -146,7 +136,7 @@ internal static class AscfChunkIndexCodec
         return new AscfIndexFooter(chunkCount, rawSize, indexOffset, indexLength, indexChecksum);
     }
 
-    private static void WriteEntry(Span<byte> destination, AscfChunkIndexEntry entry)
+    public static void WriteEntry(Span<byte> destination, AscfChunkIndexEntry entry)
     {
         destination.Clear();
         BinaryPrimitives.WriteInt32LittleEndian(destination[0x00..], entry.ChunkIndex);
