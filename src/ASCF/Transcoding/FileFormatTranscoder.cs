@@ -17,12 +17,12 @@ public static class FileFormatTranscoder
         Lz4Stream
     }
 
-    public static async Task<WrappedLz4FileFormat.WriteResult> ConvertAscfFileToWrappedLz4Async(
+    public static Task<WrappedLz4FileFormat.WriteResult> ConvertAscfFileToWrappedLz4Async(
         string ascfPath,
         string rawTempPath,
         string wrappedTempPath,
         CancellationToken token)
-        => await ConvertAscfFileToWrappedLz4Async(ascfPath, rawTempPath, wrappedTempPath, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertAscfFileToWrappedLz4Async(ascfPath, rawTempPath, wrappedTempPath, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<WrappedLz4FileFormat.WriteResult> ConvertAscfFileToWrappedLz4Async(
         string ascfPath,
@@ -49,12 +49,12 @@ public static class FileFormatTranscoder
         return wrapped;
     }
 
-    public static async Task<ConvertResult> ConvertWrappedLz4ToAscfAsync(
+    public static Task<ConvertResult> ConvertWrappedLz4ToAscfAsync(
         string wrappedPath,
         string rawTempPath,
         string ascfTempPath,
         CancellationToken token)
-        => await ConvertWrappedLz4ToAscfAsync(wrappedPath, rawTempPath, ascfTempPath, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertWrappedLz4ToAscfAsync(wrappedPath, rawTempPath, ascfTempPath, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertResult> ConvertWrappedLz4ToAscfAsync(
         string wrappedPath,
@@ -81,14 +81,14 @@ public static class FileFormatTranscoder
         return new ConvertResult(rawSize, storedSize);
     }
 
-    public static async Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
+    public static Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
         string lz4Path,
         long lz4Length,
         string rawTempPath,
         string ascfTempPath,
         int streamBufferSize,
         CancellationToken token)
-        => await ConvertLz4PayloadToAscfWithHashAsync(lz4Path, lz4Length, rawTempPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertLz4PayloadToAscfWithHashAsync(lz4Path, lz4Length, rawTempPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
         string lz4Path,
@@ -112,12 +112,12 @@ public static class FileFormatTranscoder
         return new ConvertHashResult(stream.Hash, stream.RawSize, stream.StoredSize, Lz4PayloadFormat.Lz4Stream);
     }
 
-    public static async Task<ConvertHashResult> ConvertWrappedLz4ToAscfWithHashAsync(
+    public static Task<ConvertHashResult> ConvertWrappedLz4ToAscfWithHashAsync(
         string wrappedPath,
         string rawTempPath,
         string ascfTempPath,
         CancellationToken token)
-        => await ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, rawTempPath, ascfTempPath, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, rawTempPath, ascfTempPath, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertHashResult> ConvertWrappedLz4ToAscfWithHashAsync(
         string wrappedPath,
@@ -140,12 +140,12 @@ public static class FileFormatTranscoder
         return new ConvertHashResult(result.Hash, result.RawSize, result.StoredSize, Lz4PayloadFormat.WrappedLz4);
     }
 
-    public static async Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
+    public static Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
         string streamPath,
         string ascfTempPath,
         int streamBufferSize,
         CancellationToken token)
-        => await ConvertLz4StreamToAscfWithHashAsync(streamPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertLz4StreamToAscfWithHashAsync(streamPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
         string streamPath,
@@ -160,12 +160,12 @@ public static class FileFormatTranscoder
         return new ConvertHashResult(result.Hash, result.RawSize, result.StoredSize, Lz4PayloadFormat.Lz4Stream);
     }
 
-    public static async Task<ConvertResult> ConvertLz4StreamToAscfAsync(
+    public static Task<ConvertResult> ConvertLz4StreamToAscfAsync(
         string streamPath,
         string ascfTempPath,
         int streamBufferSize,
         CancellationToken token)
-        => await ConvertLz4StreamToAscfAsync(streamPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token).ConfigureAwait(false);
+        => ConvertLz4StreamToAscfAsync(streamPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertResult> ConvertLz4StreamToAscfAsync(
         string streamPath,

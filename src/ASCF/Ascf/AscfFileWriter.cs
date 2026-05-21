@@ -27,8 +27,8 @@ public static class AscfFileWriter
     [StructLayout(LayoutKind.Auto)]
     private readonly record struct ChunkWriteResult(int RawLength, long EncodedLength);
 
-    public static async Task<long> WriteFileAsync(string sourcePath, string outputPath, CancellationToken token)
-        => await WriteFileAsync(sourcePath, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+    public static Task<long> WriteFileAsync(string sourcePath, string outputPath, CancellationToken token)
+        => WriteFileAsync(sourcePath, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<long> WriteFileAsync(string sourcePath, string outputPath, AscfWriterOptions options, CancellationToken token)
     {
@@ -50,8 +50,8 @@ public static class AscfFileWriter
         }
     }
 
-    public static async Task<HashedWriteResult> WriteFileWithHashAsync(string sourcePath, string outputPath, CancellationToken token)
-        => await WriteFileWithHashAsync(sourcePath, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+    public static Task<HashedWriteResult> WriteFileWithHashAsync(string sourcePath, string outputPath, CancellationToken token)
+        => WriteFileWithHashAsync(sourcePath, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<HashedWriteResult> WriteFileWithHashAsync(string sourcePath, string outputPath, AscfWriterOptions options, CancellationToken token)
     {
@@ -73,8 +73,8 @@ public static class AscfFileWriter
         }
     }
 
-    public static async Task WriteFileAsync(string sourcePath, Stream destination, CancellationToken token)
-        => await WriteFileAsync(sourcePath, destination, AscfWriterOptions.Default, token).ConfigureAwait(false);
+    public static Task WriteFileAsync(string sourcePath, Stream destination, CancellationToken token)
+        => WriteFileAsync(sourcePath, destination, AscfWriterOptions.Default, token);
 
     public static async Task WriteFileAsync(string sourcePath, Stream destination, AscfWriterOptions options, CancellationToken token)
     {
@@ -82,14 +82,14 @@ public static class AscfFileWriter
         await WriteFileInternalAsync(sourcePath, destination, hasher: null, new WriteOptions(options, null, null, null), token).ConfigureAwait(false);
     }
 
-    public static async Task WriteFileAsync(
+    public static Task WriteFileAsync(
         string sourcePath,
         Stream destination,
         Func<int, CancellationToken, ValueTask>? waitForBytes,
         IProgress<long>? progress,
         AscfBufferTransform? transform,
         CancellationToken token)
-        => await WriteFileAsync(sourcePath, destination, AscfWriterOptions.Default, waitForBytes, progress, transform, token).ConfigureAwait(false);
+        => WriteFileAsync(sourcePath, destination, AscfWriterOptions.Default, waitForBytes, progress, transform, token);
 
     public static async Task WriteFileAsync(
         string sourcePath,
@@ -153,8 +153,8 @@ public static class AscfFileWriter
         }
     }
 
-    public static async Task<WriteResult> WriteStreamToFileAsync(Stream source, string outputPath, CancellationToken token)
-        => await WriteStreamToFileAsync(source, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+    public static Task<WriteResult> WriteStreamToFileAsync(Stream source, string outputPath, CancellationToken token)
+        => WriteStreamToFileAsync(source, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<WriteResult> WriteStreamToFileAsync(Stream source, string outputPath, AscfWriterOptions options, CancellationToken token)
     {
@@ -182,8 +182,8 @@ public static class AscfFileWriter
         }
     }
 
-    public static async Task<HashedWriteResult> WriteStreamToFileWithHashAsync(Stream source, string outputPath, CancellationToken token)
-        => await WriteStreamToFileWithHashAsync(source, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+    public static Task<HashedWriteResult> WriteStreamToFileWithHashAsync(Stream source, string outputPath, CancellationToken token)
+        => WriteStreamToFileWithHashAsync(source, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<HashedWriteResult> WriteStreamToFileWithHashAsync(Stream source, string outputPath, AscfWriterOptions options, CancellationToken token)
     {
@@ -212,13 +212,13 @@ public static class AscfFileWriter
         }
     }
 
-    public static async Task<long> WriteStoredRawFileAsync(
+    public static Task<long> WriteStoredRawFileAsync(
         string sourcePath,
         long sourceOffset,
         long rawLength,
         string outputPath,
         CancellationToken token)
-        => await WriteStoredRawFileAsync(sourcePath, sourceOffset, rawLength, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+        => WriteStoredRawFileAsync(sourcePath, sourceOffset, rawLength, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<long> WriteStoredRawFileAsync(
         string sourcePath,
@@ -234,13 +234,13 @@ public static class AscfFileWriter
         return result.StoredSize;
     }
 
-    public static async Task<HashedWriteResult> WriteStoredRawFileWithHashAsync(
+    public static Task<HashedWriteResult> WriteStoredRawFileWithHashAsync(
         string sourcePath,
         long sourceOffset,
         long rawLength,
         string outputPath,
         CancellationToken token)
-        => await WriteStoredRawFileWithHashAsync(sourcePath, sourceOffset, rawLength, outputPath, AscfWriterOptions.Default, token).ConfigureAwait(false);
+        => WriteStoredRawFileWithHashAsync(sourcePath, sourceOffset, rawLength, outputPath, AscfWriterOptions.Default, token);
 
     public static async Task<HashedWriteResult> WriteStoredRawFileWithHashAsync(
         string sourcePath,
@@ -403,7 +403,9 @@ public static class AscfFileWriter
         var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(options.Format.RawChunkSize);
         var pendingChunks = new Queue<Task<AscfChunkCompressor.EncodedChunk>>(options.Format.CompressionWorkerCount);
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-        var entries = new List<AscfChunkIndexEntry>();
+        var entries = knownChunkCount.HasValue
+            ? new List<AscfChunkIndexEntry>(knownChunkCount.Value)
+            : [];
         using var workerSlots = new SemaphoreSlim(options.Format.CompressionWorkerCount, options.Format.CompressionWorkerCount);
         try
         {
@@ -549,7 +551,7 @@ public static class AscfFileWriter
         }
     }
 
-    private static async Task WriteHeaderAsync(
+    private static Task WriteHeaderAsync(
         Stream destination,
         long rawSize,
         int rawChunkSize,
@@ -557,16 +559,15 @@ public static class AscfFileWriter
         Guid streamId,
         long encodedSize,
         CancellationToken token)
-        => await WriteHeaderAsync(
-                destination,
-                rawSize,
-                rawChunkSize,
-                chunkCount,
-                streamId,
-                encodedSize,
-                new WriteOptions(AscfWriterOptions.Default, null, null, null),
-                token)
-            .ConfigureAwait(false);
+        => WriteHeaderAsync(
+            destination,
+            rawSize,
+            rawChunkSize,
+            chunkCount,
+            streamId,
+            encodedSize,
+            new WriteOptions(AscfWriterOptions.Default, null, null, null),
+            token);
 
     private static async Task WriteHeaderAsync(
         Stream destination,
@@ -615,7 +616,7 @@ public static class AscfFileWriter
 
     private static async Task WriteIndexAsync(
         Stream destination,
-        IReadOnlyList<AscfChunkIndexEntry> entries,
+        List<AscfChunkIndexEntry> entries,
         long rawSize,
         long indexOffset,
         WriteOptions options,

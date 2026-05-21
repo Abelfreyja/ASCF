@@ -26,28 +26,30 @@ public static class AscfFileReader
         return AscfFileHeaderCodec.TryRead(buffer, options.MaxRawFileBytes, out _);
     }
 
-    public static async Task<bool> FileLooksLikeAscfAsync(string path, CancellationToken token)
-        => await FileLooksLikeAscfAsync(path, AscfReaderOptions.Default, token).ConfigureAwait(false);
+    public static Task<bool> FileLooksLikeAscfAsync(string path, CancellationToken token)
+        => FileLooksLikeAscfAsync(path, AscfReaderOptions.Default, token);
 
     public static async Task<bool> FileLooksLikeAscfAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        await using var stream = new FileStream(
+        var stream = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete,
             bufferSize: options.BufferSize,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-
-        if (stream.Length < AscfFileFormat.HeaderSize)
+        await using (stream.ConfigureAwait(false))
         {
-            return false;
-        }
+            if (stream.Length < AscfFileFormat.HeaderSize)
+            {
+                return false;
+            }
 
-        var header = new byte[AscfFileFormat.HeaderSize];
-        await FileFormatStreamReader.ReadExactlyAsync(stream, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
-        return LooksLikeAscf(header, options);
+            var header = new byte[AscfFileFormat.HeaderSize];
+            await FileFormatStreamReader.ReadExactlyAsync(stream, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            return LooksLikeAscf(header, options);
+        }
     }
 
     /// <summary> reads the chunk index from a complete file </summary>
@@ -73,8 +75,8 @@ public static class AscfFileReader
     }
 
     /// <summary> reads the chunk index from a complete file </summary>
-    public static async Task<AscfChunkIndex> ReadChunkIndexAsync(string path, CancellationToken token)
-        => await ReadChunkIndexAsync(path, AscfReaderOptions.Default, token).ConfigureAwait(false);
+    public static Task<AscfChunkIndex> ReadChunkIndexAsync(string path, CancellationToken token)
+        => ReadChunkIndexAsync(path, AscfReaderOptions.Default, token);
 
     /// <summary> reads the chunk index from a complete file </summary>
     public static async Task<AscfChunkIndex> ReadChunkIndexAsync(string path, AscfReaderOptions options, CancellationToken token)
@@ -97,8 +99,8 @@ public static class AscfFileReader
     }
 
     /// <summary> validates a partial file for chunk aligned resume </summary>
-    public static async Task<AscfPartialValidationResult> ValidatePartialFileAsync(string path, CancellationToken token)
-        => await ValidatePartialFileAsync(path, AscfReaderOptions.Default, token).ConfigureAwait(false);
+    public static Task<AscfPartialValidationResult> ValidatePartialFileAsync(string path, CancellationToken token)
+        => ValidatePartialFileAsync(path, AscfReaderOptions.Default, token);
 
     /// <summary> validates a partial file for chunk aligned resume </summary>
     public static async Task<AscfPartialValidationResult> ValidatePartialFileAsync(string path, AscfReaderOptions options, CancellationToken token)
@@ -130,33 +132,29 @@ public static class AscfFileReader
     }
 
     public static byte[] DecodeToArray(ReadOnlySpan<byte> encoded)
-        => DecodeToArray(encoded.ToArray(), AscfReaderOptions.Default);
-
-    public static byte[] DecodeToArray(ReadOnlySpan<byte> encoded, AscfReaderOptions options)
-        => DecodeToArray(encoded.ToArray(), options);
-
-    public static byte[] DecodeToArray(byte[] encoded)
         => DecodeToArray(encoded, AscfReaderOptions.Default);
 
-    public static byte[] DecodeToArray(byte[] encoded, AscfReaderOptions options)
+    public static byte[] DecodeToArray(ReadOnlySpan<byte> encoded, AscfReaderOptions options)
     {
         options.Validate();
-        if (!LooksLikeAscf(encoded, options))
-        {
-            throw new InvalidDataException(".ascf header is invalid.");
-        }
-
-        var fileHeader = AscfFileHeaderCodec.Read(encoded.AsSpan(0, AscfFileFormat.HeaderSize), options.MaxRawFileBytes);
+        var fileHeader = ValidateHeader(encoded, options);
         if (fileHeader.RawSize > options.MaxInMemoryDecodeBytes || fileHeader.RawSize > int.MaxValue)
         {
             throw new InvalidDataException($".ascf raw size is too large for an in-memory decode ({fileHeader.RawSize} bytes).");
         }
 
-        using var input = new MemoryStream(encoded, writable: false);
-        using var output = new MemoryStream(checked((int)fileHeader.RawSize));
-        DecodeStreamToStream(input, output, options);
-        return output.ToArray();
+        var raw = fileHeader.RawSize == 0
+            ? []
+            : GC.AllocateUninitializedArray<byte>(checked((int)fileHeader.RawSize));
+        DecodeToArray(encoded, raw, fileHeader);
+        return raw;
     }
+
+    public static byte[] DecodeToArray(byte[] encoded)
+        => DecodeToArray(encoded.AsSpan(), AscfReaderOptions.Default);
+
+    public static byte[] DecodeToArray(byte[] encoded, AscfReaderOptions options)
+        => DecodeToArray(encoded.AsSpan(), options);
 
     public static DecodeResult ComputeFileHash(string inputPath)
         => ComputeFileHash(inputPath, AscfReaderOptions.Default);
@@ -192,10 +190,9 @@ public static class AscfFileReader
                 var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
 
                 FileFormatStreamReader.ReadExactly(input, compressedBuffer.AsSpan(0, chunk.StoredLength));
-                ValidateStoredChecksum(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
+                ValidateStoredChecksumAndRawIfStoredRaw(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
                 if (chunk.StoresRaw)
                 {
-                    ValidateRawChecksum(chunk, compressedBuffer.AsSpan(0, chunk.RawLength));
                     hasher.AppendData(compressedBuffer.AsSpan(0, chunk.RawLength));
                 }
                 else
@@ -230,18 +227,18 @@ public static class AscfFileReader
         }
     }
 
-    public static async Task<StoredStreamResult> CopyEncodedStreamToFileAsync(
+    public static Task<StoredStreamResult> CopyEncodedStreamToFileAsync(
         Stream encodedStream,
         string outputPath,
         CancellationToken token)
-        => await CopyEncodedStreamToFileAsync(encodedStream, outputPath, transform: null, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => CopyEncodedStreamToFileAsync(encodedStream, outputPath, transform: null, AscfReaderOptions.Default, token);
 
-    public static async Task<StoredStreamResult> CopyEncodedStreamToFileAsync(
+    public static Task<StoredStreamResult> CopyEncodedStreamToFileAsync(
         Stream encodedStream,
         string outputPath,
         AscfBufferTransform? transform,
         CancellationToken token)
-        => await CopyEncodedStreamToFileAsync(encodedStream, outputPath, transform, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => CopyEncodedStreamToFileAsync(encodedStream, outputPath, transform, AscfReaderOptions.Default, token);
 
     public static async Task<StoredStreamResult> CopyEncodedStreamToFileAsync(
         Stream encodedStream,
@@ -285,10 +282,10 @@ public static class AscfFileReader
                         rawBuffer,
                         maxCompressedSize,
                         transform,
-                        token,
-                        writeWirePayload: true)
+                        writeWirePayload: true,
+                        token: token)
                     .ConfigureAwait(false);
-                await ReadAndValidateIndexAsync(encodedStream, output, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, token, writeWirePayload: true)
+                await ReadAndValidateIndexAsync(encodedStream, output, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: true, token: token)
                     .ConfigureAwait(false);
 
                 if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
@@ -307,11 +304,11 @@ public static class AscfFileReader
         }
     }
 
-    public static async Task<DecodeResult> DecodeFileToRawFileAsync(
+    public static Task<DecodeResult> DecodeFileToRawFileAsync(
         string inputPath,
         string outputPath,
         CancellationToken token)
-        => await DecodeFileToRawFileAsync(inputPath, outputPath, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => DecodeFileToRawFileAsync(inputPath, outputPath, AscfReaderOptions.Default, token);
 
     public static async Task<DecodeResult> DecodeFileToRawFileAsync(
         string inputPath,
@@ -333,11 +330,11 @@ public static class AscfFileReader
         }
     }
 
-    public static async Task<long> DecodeFileToFileAsync(
+    public static Task<long> DecodeFileToFileAsync(
         string inputPath,
         string outputPath,
         CancellationToken token)
-        => await DecodeFileToFileAsync(inputPath, outputPath, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => DecodeFileToFileAsync(inputPath, outputPath, AscfReaderOptions.Default, token);
 
     public static async Task<long> DecodeFileToFileAsync(
         string inputPath,
@@ -349,11 +346,11 @@ public static class AscfFileReader
         return result.RawSize;
     }
 
-    public static async Task<WrappedLz4FileFormat.WriteResult?> TryWriteStoredRawWrappedLz4Async(
+    public static Task<WrappedLz4FileFormat.WriteResult?> TryWriteStoredRawWrappedLz4Async(
         string inputPath,
         string outputPath,
         CancellationToken token)
-        => await TryWriteStoredRawWrappedLz4Async(inputPath, outputPath, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => TryWriteStoredRawWrappedLz4Async(inputPath, outputPath, AscfReaderOptions.Default, token);
 
     public static async Task<WrappedLz4FileFormat.WriteResult?> TryWriteStoredRawWrappedLz4Async(
         string inputPath,
@@ -458,7 +455,7 @@ public static class AscfFileReader
             throw new InvalidDataException(".ascf decoded raw size did not match the header.");
         }
 
-        await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, token, writeWirePayload: false)
+        await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, writeWirePayload: false, token: token)
             .ConfigureAwait(false);
         if (input.Position != input.Length)
         {
@@ -487,8 +484,7 @@ public static class AscfFileReader
                 }
 
                 await FileFormatStreamReader.ReadExactlyAsync(input, copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
-                ValidateStoredChecksum(chunk, copyBuffer.AsSpan(0, chunk.StoredLength));
-                ValidateRawChecksum(chunk, copyBuffer.AsSpan(0, chunk.RawLength));
+                ValidateStoredChecksumAndRawIfStoredRaw(chunk, copyBuffer.AsSpan(0, chunk.StoredLength));
                 await output.WriteAsync(copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
                 rawSize += chunk.RawLength;
             }
@@ -499,18 +495,18 @@ public static class AscfFileReader
         }
     }
 
-    public static async Task<DecodeResult> DecodeStreamToRawFileAsync(
+    public static Task<DecodeResult> DecodeStreamToRawFileAsync(
         Stream encodedStream,
         string outputPath,
         CancellationToken token)
-        => await DecodeStreamToRawFileAsync(encodedStream, outputPath, transform: null, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => DecodeStreamToRawFileAsync(encodedStream, outputPath, transform: null, AscfReaderOptions.Default, token);
 
-    public static async Task<DecodeResult> DecodeStreamToRawFileAsync(
+    public static Task<DecodeResult> DecodeStreamToRawFileAsync(
         Stream encodedStream,
         string outputPath,
         AscfBufferTransform? transform,
         CancellationToken token)
-        => await DecodeStreamToRawFileAsync(encodedStream, outputPath, transform, AscfReaderOptions.Default, token).ConfigureAwait(false);
+        => DecodeStreamToRawFileAsync(encodedStream, outputPath, transform, AscfReaderOptions.Default, token);
 
     public static async Task<DecodeResult> DecodeStreamToRawFileAsync(
         Stream encodedStream,
@@ -553,10 +549,10 @@ public static class AscfFileReader
                         rawBuffer,
                         maxCompressedSize,
                         transform,
-                        token,
-                        writeWirePayload: false)
+                        writeWirePayload: false,
+                        token: token)
                     .ConfigureAwait(false);
-                await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, token, writeWirePayload: false)
+                await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token: token)
                     .ConfigureAwait(false);
 
                 if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
@@ -585,8 +581,8 @@ public static class AscfFileReader
         byte[] rawBuffer,
         int maxCompressedSize,
         AscfBufferTransform? transform,
-        CancellationToken token,
-        bool writeWirePayload)
+        bool writeWirePayload,
+        CancellationToken token)
     {
         long rawSize = 0;
         long encodedOffset = AscfFileFormat.HeaderSize;
@@ -597,7 +593,7 @@ public static class AscfFileReader
             var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
 
             await ReadTransformedBytesAsync(encodedStream, compressedBuffer.AsMemory(0, chunk.StoredLength), transform, token).ConfigureAwait(false);
-            ValidateStoredChecksum(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
+            ValidateStoredChecksumAndRawIfStoredRaw(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
             if (writeWirePayload)
             {
                 await output.WriteAsync(chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
@@ -606,7 +602,6 @@ public static class AscfFileReader
 
             if (chunk.StoresRaw)
             {
-                ValidateRawChecksum(chunk, compressedBuffer.AsSpan(0, chunk.RawLength));
                 hasher?.AppendData(compressedBuffer.AsSpan(0, chunk.RawLength));
                 if (!writeWirePayload)
                 {
@@ -637,62 +632,45 @@ public static class AscfFileReader
         return new DecodedChunkResult(rawSize, encodedOffset, entries);
     }
 
-    private static long DecodeStreamToStream(Stream input, Stream output, AscfReaderOptions options)
+    private static void DecodeToArray(ReadOnlySpan<byte> encoded, byte[] raw, AscfFileHeader fileHeader)
     {
-        var header = new byte[AscfFileFormat.HeaderSize];
-        FileFormatStreamReader.ReadExactly(input, header);
-        var fileHeader = ValidateHeader(header, options);
-
-        var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
-        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
         var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
-        try
+        long rawSize = 0;
+        long encodedOffset = AscfFileFormat.HeaderSize;
+        var position = AscfFileFormat.HeaderSize;
+        for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
         {
-            long rawSize = 0;
-            long encodedOffset = AscfFileFormat.HeaderSize;
-            for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
+            var chunkHeader = ReadSlice(encoded, ref position, AscfFileFormat.ChunkHeaderSize);
+            var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
+            var stored = ReadSlice(encoded, ref position, chunk.StoredLength);
+
+            ValidateStoredChecksumAndRawIfStoredRaw(chunk, stored);
+            var destination = raw.AsSpan(checked((int)rawSize), chunk.RawLength);
+            if (chunk.StoresRaw)
             {
-                FileFormatStreamReader.ReadExactly(input, chunkHeader);
-                var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
-
-                FileFormatStreamReader.ReadExactly(input, compressedBuffer.AsSpan(0, chunk.StoredLength));
-                ValidateStoredChecksum(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
-                if (chunk.StoresRaw)
-                {
-                    ValidateRawChecksum(chunk, compressedBuffer.AsSpan(0, chunk.RawLength));
-                    output.Write(compressedBuffer.AsSpan(0, chunk.RawLength));
-                }
-                else
-                {
-                    Lz4BlockCodec.Decode(compressedBuffer.AsSpan(0, chunk.StoredLength), rawBuffer.AsSpan(0, chunk.RawLength), chunk.RawLength);
-                    ValidateRawChecksum(chunk, rawBuffer.AsSpan(0, chunk.RawLength));
-                    output.Write(rawBuffer.AsSpan(0, chunk.RawLength));
-                }
-
-                entries.Add(ToIndexEntry(chunk, encodedOffset));
-                rawSize += chunk.RawLength;
-                encodedOffset += AscfFileFormat.ChunkHeaderSize + chunk.StoredLength;
+                stored.CopyTo(destination);
+            }
+            else
+            {
+                Lz4BlockCodec.Decode(stored, destination, chunk.RawLength);
+                ValidateRawChecksum(chunk, destination);
             }
 
-            if (rawSize != fileHeader.RawSize)
-            {
-                throw new InvalidDataException(".ascf decoded raw size did not match the header.");
-            }
-
-            ReadAndValidateIndex(input, entries, rawSize, encodedOffset);
-            if (input.Position != input.Length)
-            {
-                throw new InvalidDataException(".ascf stream contained trailing bytes.");
-            }
-
-            return rawSize;
+            entries.Add(ToIndexEntry(chunk, encodedOffset));
+            rawSize += chunk.RawLength;
+            encodedOffset += AscfFileFormat.ChunkHeaderSize + chunk.StoredLength;
         }
-        finally
+
+        if (rawSize != fileHeader.RawSize)
         {
-            ArrayPool<byte>.Shared.Return(rawBuffer);
-            ArrayPool<byte>.Shared.Return(compressedBuffer);
+            throw new InvalidDataException(".ascf decoded raw size did not match the header.");
+        }
+
+        ReadAndValidateIndex(encoded, ref position, entries, rawSize, encodedOffset);
+        if (position != encoded.Length)
+        {
+            throw new InvalidDataException(".ascf stream contained trailing bytes.");
         }
     }
 
@@ -724,6 +702,21 @@ public static class AscfFileReader
         ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
     }
 
+    private static void ReadAndValidateIndex(
+        ReadOnlySpan<byte> encoded,
+        ref int position,
+        List<AscfChunkIndexEntry> entries,
+        long rawSize,
+        long indexOffset)
+    {
+        var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
+        var index = ReadSlice(encoded, ref position, indexLength);
+        var footerBytes = ReadSlice(encoded, ref position, AscfFileFormat.IndexFooterSize);
+        var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
+        ValidateIndexFooter(footer, entries, rawSize, indexOffset);
+        ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
+    }
+
     private static async Task ReadAndValidateIndexAsync(
         Stream input,
         Stream? output,
@@ -731,8 +724,8 @@ public static class AscfFileReader
         long rawSize,
         long indexOffset,
         AscfBufferTransform? transform,
-        CancellationToken token,
-        bool writeWirePayload)
+        bool writeWirePayload,
+        CancellationToken token)
     {
         var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
         var index = new byte[indexLength];
@@ -747,11 +740,7 @@ public static class AscfFileReader
 
         if (writeWirePayload)
         {
-            if (output == null)
-            {
-                throw new ArgumentNullException(nameof(output));
-            }
-
+            ArgumentNullException.ThrowIfNull(output);
             await output.WriteAsync(index.AsMemory(0, index.Length), token).ConfigureAwait(false);
             await output.WriteAsync(footerBytes.AsMemory(0, footerBytes.Length), token).ConfigureAwait(false);
         }
@@ -856,7 +845,7 @@ public static class AscfFileReader
 
             try
             {
-                await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, token, writeWirePayload: false)
+                await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, writeWirePayload: false, token: token)
                     .ConfigureAwait(false);
             }
             catch (InvalidDataException)
@@ -878,10 +867,9 @@ public static class AscfFileReader
     {
         try
         {
-            ValidateStoredChecksum(chunk, stored);
+            ValidateStoredChecksumAndRawIfStoredRaw(chunk, stored);
             if (chunk.StoresRaw)
             {
-                ValidateRawChecksum(chunk, stored[..chunk.RawLength]);
                 return true;
             }
 
@@ -905,7 +893,7 @@ public static class AscfFileReader
 
     private static void ValidateIndexFooter(
         AscfIndexFooter footer,
-        IReadOnlyList<AscfChunkIndexEntry> entries,
+        List<AscfChunkIndexEntry> entries,
         long rawSize,
         long indexOffset)
     {
@@ -917,7 +905,7 @@ public static class AscfFileReader
         }
     }
 
-    private static void ValidateIndexEntries(AscfChunkIndex index, IReadOnlyList<AscfChunkIndexEntry> expected)
+    private static void ValidateIndexEntries(AscfChunkIndex index, List<AscfChunkIndexEntry> expected)
     {
         if (index.Entries.Count != expected.Count)
         {
@@ -944,12 +932,17 @@ public static class AscfFileReader
         }
     }
 
-    private static void ValidateStoredChecksum(AscfChunkHeader chunk, ReadOnlySpan<byte> stored)
+    private static void ValidateStoredChecksumAndRawIfStoredRaw(AscfChunkHeader chunk, ReadOnlySpan<byte> stored)
     {
         var checksum = AscfChecksum.ComputeXxHash3(stored);
         if (checksum != chunk.StoredChecksum)
         {
             throw new InvalidDataException(".ascf stored chunk checksum mismatch.");
+        }
+
+        if (chunk.StoresRaw && checksum != chunk.RawChecksum)
+        {
+            throw new InvalidDataException(".ascf raw chunk checksum mismatch.");
         }
     }
 
@@ -960,6 +953,18 @@ public static class AscfFileReader
         {
             throw new InvalidDataException(".ascf raw chunk checksum mismatch.");
         }
+    }
+
+    private static ReadOnlySpan<byte> ReadSlice(ReadOnlySpan<byte> source, ref int position, int length)
+    {
+        if ((uint)position > (uint)source.Length || source.Length - position < length)
+        {
+            throw new EndOfStreamException();
+        }
+
+        var slice = source.Slice(position, length);
+        position = checked(position + length);
+        return slice;
     }
 
     private static async Task ReadTransformedBytesAsync(Stream stream, Memory<byte> buffer, AscfBufferTransform? transform, CancellationToken token)

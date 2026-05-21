@@ -17,8 +17,8 @@ public static class WrappedLz4FileFormat
     [StructLayout(LayoutKind.Auto)]
     public readonly record struct Header(int OutputLength, int InputLength);
 
-    public static async Task<WriteResult> WriteFromRawFileAsync(string sourcePath, string outputPath, CancellationToken token)
-        => await WriteFromRawFileAsync(sourcePath, outputPath, Lz4FormatOptions.Default, token).ConfigureAwait(false);
+    public static Task<WriteResult> WriteFromRawFileAsync(string sourcePath, string outputPath, CancellationToken token)
+        => WriteFromRawFileAsync(sourcePath, outputPath, Lz4FormatOptions.Default, token);
 
     public static async Task<WriteResult> WriteFromRawFileAsync(string sourcePath, string outputPath, Lz4FormatOptions options, CancellationToken token)
     {
@@ -46,8 +46,8 @@ public static class WrappedLz4FileFormat
             : WriteMemoryMappedFile(sourcePath, outputPath, options, token);
     }
 
-    public static async Task<long> ExtractToRawFileAsync(string wrappedPath, string outputPath, CancellationToken token)
-        => await ExtractToRawFileAsync(wrappedPath, outputPath, Lz4FormatOptions.Default, token).ConfigureAwait(false);
+    public static Task<long> ExtractToRawFileAsync(string wrappedPath, string outputPath, CancellationToken token)
+        => ExtractToRawFileAsync(wrappedPath, outputPath, Lz4FormatOptions.Default, token);
 
     public static async Task<long> ExtractToRawFileAsync(string wrappedPath, string outputPath, Lz4FormatOptions options, CancellationToken token)
     {
@@ -80,8 +80,8 @@ public static class WrappedLz4FileFormat
         }
     }
 
-    public static async Task<long> DecodeFileToFileAsync(string inputPath, string outputPath, CancellationToken token)
-        => await ExtractToRawFileAsync(inputPath, outputPath, token).ConfigureAwait(false);
+    public static Task<long> DecodeFileToFileAsync(string inputPath, string outputPath, CancellationToken token)
+        => ExtractToRawFileAsync(inputPath, outputPath, token);
 
     public static byte[] DecodeToArray(byte[] wrapped)
         => DecodeToArray(wrapped, Lz4FormatOptions.Default);
@@ -180,8 +180,8 @@ public static class WrappedLz4FileFormat
         BinaryPrimitives.WriteInt32LittleEndian(header.Slice(4, 4), inputLength);
     }
 
-    public static async Task<Header?> TryReadHeaderAsync(string path, long fileLength, int bufferSize, CancellationToken token)
-        => await TryReadHeaderAsync(path, fileLength, bufferSize, Lz4FormatOptions.Default, token).ConfigureAwait(false);
+    public static Task<Header?> TryReadHeaderAsync(string path, long fileLength, int bufferSize, CancellationToken token)
+        => TryReadHeaderAsync(path, fileLength, bufferSize, Lz4FormatOptions.Default, token);
 
     public static async Task<Header?> TryReadHeaderAsync(string path, long fileLength, int bufferSize, Lz4FormatOptions options, CancellationToken token)
     {

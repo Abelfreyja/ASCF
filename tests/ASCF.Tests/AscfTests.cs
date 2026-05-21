@@ -26,7 +26,11 @@ public sealed class AscfTests : IDisposable
         var hash = AscfFileReader.ComputeFileHash(ascfPath);
         var decodedSize = await AscfFileReader.DecodeFileToFileAsync(ascfPath, decodedPath, CancellationToken.None);
         var decoded = await File.ReadAllBytesAsync(decodedPath);
-        var decodedFromArray = AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath));
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        var decodedFromArray = AscfFileReader.DecodeToArray(encoded);
+        var wrappedEncoded = new byte[encoded.Length + 32];
+        encoded.CopyTo(wrappedEncoded.AsSpan(17));
+        var decodedFromSpan = AscfFileReader.DecodeToArray(wrappedEncoded.AsSpan(17, encoded.Length));
 
         Assert.True(storedSize > AscfFileFormat.HeaderSize);
         Assert.Equal(EncodedFileFormat.Ascf, EncodedFileFormatIdentifier.Identify(ascfPath, new FileInfo(ascfPath).Length));
@@ -36,6 +40,7 @@ public sealed class AscfTests : IDisposable
         Assert.Equal(raw.Length, decodedSize);
         Assert.Equal(raw, decoded);
         Assert.Equal(raw, decodedFromArray);
+        Assert.Equal(raw, decodedFromSpan);
     }
 
     [Fact]
@@ -186,10 +191,13 @@ public sealed class AscfTests : IDisposable
     private static async Task<byte[]> ReadHeaderAsync(string path, int byteCount)
     {
         var header = new byte[byteCount];
-        await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var read = await input.ReadAsync(header);
-        Assert.Equal(byteCount, read);
-        return header;
+        var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        await using (input.ConfigureAwait(false))
+        {
+            var read = await input.ReadAsync(header).ConfigureAwait(false);
+            Assert.Equal(byteCount, read);
+            return header;
+        }
     }
 
     private static byte[] CreateMixedPayload(int length)

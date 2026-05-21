@@ -7,12 +7,12 @@ namespace ASCF.Lz4;
 
 public static class Lz4StreamFormat
 {
-    public static async Task<AscfFileWriter.WriteResult> ConvertToAscfFileAsync(
+    public static Task<AscfFileWriter.WriteResult> ConvertToAscfFileAsync(
         string compressedPath,
         string outputPath,
         int streamBufferSize,
         CancellationToken token)
-        => await ConvertToAscfFileAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token).ConfigureAwait(false);
+        => ConvertToAscfFileAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token);
 
     public static async Task<AscfFileWriter.WriteResult> ConvertToAscfFileAsync(
         string compressedPath,
@@ -31,12 +31,12 @@ public static class Lz4StreamFormat
         }
     }
 
-    public static async Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
+    public static Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
         string compressedPath,
         string outputPath,
         int streamBufferSize,
         CancellationToken token)
-        => await ConvertToAscfFileWithHashAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token).ConfigureAwait(false);
+        => ConvertToAscfFileWithHashAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token);
 
     public static async Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
         string compressedPath,
@@ -55,13 +55,13 @@ public static class Lz4StreamFormat
         }
     }
 
-    public static async Task<long> ExtractToRawFileAsync(
+    public static Task<long> ExtractToRawFileAsync(
         string compressedPath,
         string outputPath,
         int streamBufferSize,
         int copyBufferSize,
         CancellationToken token)
-        => await ExtractToRawFileAsync(compressedPath, outputPath, streamBufferSize, copyBufferSize, Lz4FormatOptions.Default, token).ConfigureAwait(false);
+        => ExtractToRawFileAsync(compressedPath, outputPath, streamBufferSize, copyBufferSize, Lz4FormatOptions.Default, token);
 
     public static async Task<long> ExtractToRawFileAsync(
         string compressedPath,
@@ -103,12 +103,12 @@ public static class Lz4StreamFormat
         }
     }
 
-    public static async Task<FileFormatHashResult> ComputeFileHashAsync(
+    public static Task<FileFormatHashResult> ComputeFileHashAsync(
         string compressedPath,
         int streamBufferSize,
         int copyBufferSize,
         CancellationToken token)
-        => await ComputeFileHashAsync(compressedPath, streamBufferSize, copyBufferSize, Lz4FormatOptions.Default, token).ConfigureAwait(false);
+        => ComputeFileHashAsync(compressedPath, streamBufferSize, copyBufferSize, Lz4FormatOptions.Default, token);
 
     public static async Task<FileFormatHashResult> ComputeFileHashAsync(
         string compressedPath,

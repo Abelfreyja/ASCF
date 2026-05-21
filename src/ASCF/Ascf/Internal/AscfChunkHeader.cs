@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 
 namespace ASCF;
 
+[StructLayout(LayoutKind.Auto)]
 internal readonly record struct AscfChunkHeader(
     int ChunkIndex,
     int Method,

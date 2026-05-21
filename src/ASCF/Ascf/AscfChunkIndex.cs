@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace ASCF;
 
 /// <summary> chunk index read from an .ascf footer. </summary>
@@ -91,6 +93,7 @@ public sealed class AscfChunkIndex
 }
 
 /// <summary> One entry in the .ascf chunk index. </summary>
+[StructLayout(LayoutKind.Auto)]
 public readonly record struct AscfChunkIndexEntry(
     int ChunkIndex,
     int Method,
