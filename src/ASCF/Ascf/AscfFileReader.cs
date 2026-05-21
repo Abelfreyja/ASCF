@@ -47,7 +47,7 @@ public static class AscfFileReader
             }
 
             var header = new byte[AscfFileFormat.HeaderSize];
-            await FileFormatStreamReader.ReadExactlyAsync(stream, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
             return LooksLikeAscf(header, options);
         }
     }
@@ -69,7 +69,7 @@ public static class AscfFileReader
             FileOptions.SequentialScan);
 
         var header = new byte[AscfFileFormat.HeaderSize];
-        FileFormatStreamReader.ReadExactly(input, header);
+        input.ReadExactly(header);
         var fileHeader = ValidateHeader(header, options);
         return ReadChunkIndexFromEnd(input, fileHeader);
     }
@@ -92,7 +92,7 @@ public static class AscfFileReader
         await using (input.ConfigureAwait(false))
         {
             var header = new byte[AscfFileFormat.HeaderSize];
-            await FileFormatStreamReader.ReadExactlyAsync(input, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
             var fileHeader = ValidateHeader(header, options);
             return await ReadChunkIndexFromEndAsync(input, fileHeader, token).ConfigureAwait(false);
         }
@@ -121,7 +121,7 @@ public static class AscfFileReader
             }
 
             var header = new byte[AscfFileFormat.HeaderSize];
-            await FileFormatStreamReader.ReadExactlyAsync(input, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
             if (!AscfFileHeaderCodec.TryRead(header, options.MaxRawFileBytes, out var fileHeader))
             {
                 return new AscfPartialValidationResult(false, false, true, 0, 0, 0);
@@ -172,7 +172,7 @@ public static class AscfFileReader
         using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
 
         var header = new byte[AscfFileFormat.HeaderSize];
-        FileFormatStreamReader.ReadExactly(input, header);
+        input.ReadExactly(header);
         var fileHeader = ValidateHeader(header, options);
 
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
@@ -186,10 +186,10 @@ public static class AscfFileReader
             long encodedOffset = AscfFileFormat.HeaderSize;
             for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
             {
-                FileFormatStreamReader.ReadExactly(input, chunkHeader);
+                input.ReadExactly(chunkHeader);
                 var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
 
-                FileFormatStreamReader.ReadExactly(input, compressedBuffer.AsSpan(0, chunk.StoredLength));
+                input.ReadExactly(compressedBuffer.AsSpan(0, chunk.StoredLength));
                 ValidateStoredChecksumAndRawIfStoredRaw(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
                 if (chunk.StoresRaw)
                 {
@@ -414,7 +414,7 @@ public static class AscfFileReader
     private static async Task<AscfFileHeader> ReadHeaderAsync(Stream input, AscfReaderOptions options, CancellationToken token)
     {
         var header = new byte[AscfFileFormat.HeaderSize];
-        await FileFormatStreamReader.ReadExactlyAsync(input, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+        await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
         return ValidateHeader(header, options);
     }
 
@@ -437,7 +437,7 @@ public static class AscfFileReader
         {
             for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
             {
-                await FileFormatStreamReader.ReadExactlyAsync(input, chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
+                await input.ReadExactlyAsync(chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
                 var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
 
                 if (!chunk.StoresRaw)
@@ -445,7 +445,7 @@ public static class AscfFileReader
                     return false;
                 }
 
-                await FileFormatStreamReader.ReadExactlyAsync(input, copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
+                await input.ReadExactlyAsync(copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
                 ValidateStoredChecksumAndRawIfStoredRaw(chunk, copyBuffer.AsSpan(0, chunk.StoredLength));
                 await output.WriteAsync(copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
 
@@ -674,8 +674,10 @@ public static class AscfFileReader
         long indexOffset)
     {
         var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
-        var index = FileFormatStreamReader.ReadExactlyToArray(input, indexLength);
-        var footerBytes = FileFormatStreamReader.ReadExactlyToArray(input, AscfFileFormat.IndexFooterSize);
+        var index = new byte[indexLength];
+        input.ReadExactly(index);
+        var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
+        input.ReadExactly(footerBytes);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
         ValidateIndexFooter(footer, entries, rawSize, indexOffset);
         ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
@@ -733,12 +735,14 @@ public static class AscfFileReader
         }
 
         input.Position = input.Length - AscfFileFormat.IndexFooterSize;
-        var footerBytes = FileFormatStreamReader.ReadExactlyToArray(input, AscfFileFormat.IndexFooterSize);
+        var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
+        input.ReadExactly(footerBytes);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, input.Length);
         ValidateFooterAgainstHeader(footer, fileHeader);
 
         input.Position = footer.IndexOffset;
-        var index = FileFormatStreamReader.ReadExactlyToArray(input, checked((int)footer.IndexLength));
+        var index = new byte[checked((int)footer.IndexLength)];
+        input.ReadExactly(index);
         var chunkIndex = AscfChunkIndexCodec.ReadIndex(index, footer);
         ValidateIndexRawSize(chunkIndex, fileHeader.RawSize);
         return chunkIndex;
@@ -752,12 +756,14 @@ public static class AscfFileReader
         }
 
         input.Position = input.Length - AscfFileFormat.IndexFooterSize;
-        var footerBytes = await FileFormatStreamReader.ReadExactlyToArrayAsync(input, AscfFileFormat.IndexFooterSize, token).ConfigureAwait(false);
+        var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
+        await input.ReadExactlyAsync(footerBytes.AsMemory(0, footerBytes.Length), token).ConfigureAwait(false);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, input.Length);
         ValidateFooterAgainstHeader(footer, fileHeader);
 
         input.Position = footer.IndexOffset;
-        var index = await FileFormatStreamReader.ReadExactlyToArrayAsync(input, checked((int)footer.IndexLength), token).ConfigureAwait(false);
+        var index = new byte[checked((int)footer.IndexLength)];
+        await input.ReadExactlyAsync(index.AsMemory(0, index.Length), token).ConfigureAwait(false);
         var chunkIndex = AscfChunkIndexCodec.ReadIndex(index, footer);
         ValidateIndexRawSize(chunkIndex, fileHeader.RawSize);
         return chunkIndex;
@@ -784,7 +790,7 @@ public static class AscfFileReader
                     return new AscfPartialValidationResult(true, false, false, chunkIndex, rawSize, encodedOffset);
                 }
 
-                await FileFormatStreamReader.ReadExactlyAsync(input, chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
+                await input.ReadExactlyAsync(chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
                 AscfChunkHeader chunk;
                 try
                 {
@@ -800,7 +806,7 @@ public static class AscfFileReader
                     return new AscfPartialValidationResult(true, false, false, chunkIndex, rawSize, encodedOffset);
                 }
 
-                await FileFormatStreamReader.ReadExactlyAsync(input, compressedBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
+                await input.ReadExactlyAsync(compressedBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
                 if (!TryValidateChunkPayload(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength), rawBuffer))
                 {
                     return new AscfPartialValidationResult(true, false, true, chunkIndex, rawSize, encodedOffset);
@@ -948,7 +954,7 @@ public static class AscfFileReader
 
     private static async Task ReadTransformedBytesAsync(Stream stream, Memory<byte> buffer, AscfBufferTransform? transform, CancellationToken token)
     {
-        await FileFormatStreamReader.ReadExactlyAsync(stream, buffer, token).ConfigureAwait(false);
+        await stream.ReadExactlyAsync(buffer, token).ConfigureAwait(false);
 
         transform?.Invoke(buffer.Span);
     }

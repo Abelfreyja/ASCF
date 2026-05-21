@@ -56,7 +56,7 @@ public static class WrappedLz4FileFormat
         await using (input.ConfigureAwait(false))
         {
             var header = new byte[HeaderSize];
-            await FileFormatStreamReader.ReadExactlyAsync(input, header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
 
             var outputLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
             var inputLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
@@ -245,7 +245,8 @@ public static class WrappedLz4FileFormat
                 return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
             }
 
-            var compressed = await FileFormatStreamReader.ReadExactlyToArrayAsync(input, header.InputLength, token).ConfigureAwait(false);
+            var compressed = new byte[header.InputLength];
+            await input.ReadExactlyAsync(compressed.AsMemory(0, compressed.Length), token).ConfigureAwait(false);
             var raw = new byte[header.OutputLength];
             Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw, header.OutputLength);
 
@@ -278,7 +279,8 @@ public static class WrappedLz4FileFormat
             return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
         }
 
-        var compressed = FileFormatStreamReader.ReadExactlyToArray(input, header.InputLength);
+        var compressed = new byte[header.InputLength];
+        input.ReadExactly(compressed);
         var raw = new byte[header.OutputLength];
         Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw, header.OutputLength);
 

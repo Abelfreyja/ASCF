@@ -71,6 +71,25 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteStreamWithSingleCompressionWorkerPreservesRawBytes()
+    {
+        var raw = CreateMixedPayload((AscfFileFormat.MinRawChunkBytes * 3) + 97);
+        await using var source = new MemoryStream(raw);
+        var ascfPath = Path.Combine(_testDirectory, "single-worker.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes,
+            CompressionWorkerCount = 1
+        };
+
+        var result = await AscfFileWriter.WriteStreamToFileAsync(source, ascfPath, options, CancellationToken.None);
+        var decoded = AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath));
+
+        Assert.Equal(raw.Length, result.RawSize);
+        Assert.Equal(raw, decoded);
+    }
+
+    [Fact]
     public async Task ConvertStoredRawAscfToWrappedLz4()
     {
         var raw = CreateIncompressiblePayload(1024 * 1024 + 7);

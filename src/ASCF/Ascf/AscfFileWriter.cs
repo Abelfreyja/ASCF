@@ -364,7 +364,7 @@ public static class AscfFileWriter
         IncrementalHash? hasher,
         CancellationToken token)
     {
-        await FileFormatStreamReader.ReadExactlyAsync(source, chunkBuffer.AsMemory(0, chunkLength), token).ConfigureAwait(false);
+        await source.ReadExactlyAsync(chunkBuffer.AsMemory(0, chunkLength), token).ConfigureAwait(false);
         var checksum = AscfChecksum.ComputeXxHash3(chunkBuffer.AsSpan(0, chunkLength));
         AscfChunkHeaderCodec.Write(
             chunkHeader,
@@ -400,6 +400,11 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
+        if (options.Format.CompressionWorkerCount == 1)
+        {
+            return await WriteCompressedChunksInlineAsync(source, destination, hasher, knownChunkCount, options, token).ConfigureAwait(false);
+        }
+
         var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(options.Format.RawChunkSize);
         var pendingChunks = new Queue<Task<AscfChunkCompressor.EncodedChunk>>(options.Format.CompressionWorkerCount);
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
@@ -458,6 +463,102 @@ public static class AscfFileWriter
         }
     }
 
+    private static async Task<CompressedWriteResult> WriteCompressedChunksInlineAsync(
+        Stream source,
+        Stream destination,
+        IncrementalHash? hasher,
+        int? knownChunkCount,
+        WriteOptions options,
+        CancellationToken token)
+    {
+        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(options.Format.RawChunkSize);
+        var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
+        var entries = knownChunkCount.HasValue
+            ? new List<AscfChunkIndexEntry>(knownChunkCount.Value)
+            : [];
+        AscfChunkCompressor.EncodedChunk? pendingChunk = null;
+        try
+        {
+            long rawSize = 0;
+            long writtenRawSize = 0;
+            long encodedOffset = AscfFileFormat.HeaderSize;
+            while (true)
+            {
+                var nextChunk = await ReadCompressedChunkInlineAsync(source, hasher, rawSize, maxCompressedSize, options, token).ConfigureAwait(false);
+                if (nextChunk == null)
+                {
+                    break;
+                }
+
+                rawSize += nextChunk.RawLength;
+                if (pendingChunk != null)
+                {
+                    var written = await WriteEncodedChunkAsync(destination, chunkHeader, pendingChunk, entries.Count, writtenRawSize, encodedOffset, isFinalChunk: false, entries, options, token)
+                        .ConfigureAwait(false);
+                    pendingChunk.Dispose();
+                    pendingChunk = null;
+                    writtenRawSize += written.RawLength;
+                    encodedOffset += written.EncodedLength;
+                    options.Progress?.Report(writtenRawSize);
+                }
+
+                pendingChunk = nextChunk;
+            }
+
+            if (pendingChunk != null)
+            {
+                var written = await WriteEncodedChunkAsync(destination, chunkHeader, pendingChunk, entries.Count, writtenRawSize, encodedOffset, isFinalChunk: true, entries, options, token)
+                    .ConfigureAwait(false);
+                pendingChunk.Dispose();
+                pendingChunk = null;
+                writtenRawSize += written.RawLength;
+                encodedOffset += written.EncodedLength;
+                options.Progress?.Report(writtenRawSize);
+            }
+
+            return new CompressedWriteResult(rawSize, entries.Count, encodedOffset, entries);
+        }
+        catch
+        {
+            pendingChunk?.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<AscfChunkCompressor.EncodedChunk?> ReadCompressedChunkInlineAsync(
+        Stream source,
+        IncrementalHash? hasher,
+        long currentRawSize,
+        int maxCompressedSize,
+        WriteOptions options,
+        CancellationToken token)
+    {
+        var rawBuffer = ArrayPool<byte>.Shared.Rent(options.Format.RawChunkSize);
+        var returnRawBuffer = true;
+        try
+        {
+            var read = await FileFormatStreamReader
+                .ReadUpToAsync(source, rawBuffer.AsMemory(0, options.Format.RawChunkSize), token)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                return null;
+            }
+
+            ValidateRawSize(currentRawSize + read, options.Format.MaxRawFileBytes);
+            hasher?.AppendData(rawBuffer.AsSpan(0, read));
+            returnRawBuffer = false;
+            return AscfChunkCompressor.Encode(rawBuffer, read, maxCompressedSize);
+        }
+        finally
+        {
+            if (returnRawBuffer)
+            {
+                ArrayPool<byte>.Shared.Return(rawBuffer);
+            }
+        }
+    }
+
     private static async Task<int> QueueNextCompressedChunkAsync(
         Stream source,
         Queue<Task<AscfChunkCompressor.EncodedChunk>> pendingChunks,
@@ -510,7 +611,21 @@ public static class AscfFileWriter
         CancellationToken token)
     {
         using var chunk = await pendingChunks.Dequeue().ConfigureAwait(false);
+        return await WriteEncodedChunkAsync(destination, chunkHeader, chunk, chunkIndex, rawOffset, chunkOffset, isFinalChunk, entries, options, token).ConfigureAwait(false);
+    }
 
+    private static async Task<ChunkWriteResult> WriteEncodedChunkAsync(
+        Stream destination,
+        byte[] chunkHeader,
+        AscfChunkCompressor.EncodedChunk chunk,
+        int chunkIndex,
+        long rawOffset,
+        long chunkOffset,
+        bool isFinalChunk,
+        List<AscfChunkIndexEntry> entries,
+        WriteOptions options,
+        CancellationToken token)
+    {
         AscfChunkHeaderCodec.Write(
             chunkHeader,
             new AscfChunkHeader(

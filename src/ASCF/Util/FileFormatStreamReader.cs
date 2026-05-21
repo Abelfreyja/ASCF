@@ -4,38 +4,6 @@ namespace ASCF.Util;
 
 internal static class FileFormatStreamReader
 {
-    public static async Task ReadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken token)
-    {
-        var read = await ReadUpToAsync(stream, buffer, token).ConfigureAwait(false);
-        if (read != buffer.Length)
-        {
-            throw new EndOfStreamException();
-        }
-    }
-
-    public static void ReadExactly(Stream stream, Span<byte> buffer)
-    {
-        var read = ReadUpTo(stream, buffer);
-        if (read != buffer.Length)
-        {
-            throw new EndOfStreamException();
-        }
-    }
-
-    public static async Task<byte[]> ReadExactlyToArrayAsync(Stream stream, int length, CancellationToken token)
-    {
-        var buffer = new byte[length];
-        await ReadExactlyAsync(stream, buffer.AsMemory(0, length), token).ConfigureAwait(false);
-        return buffer;
-    }
-
-    public static byte[] ReadExactlyToArray(Stream stream, int length)
-    {
-        var buffer = new byte[length];
-        ReadExactly(stream, buffer);
-        return buffer;
-    }
-
     public static async Task<int> ReadUpToAsync(Stream stream, Memory<byte> buffer, CancellationToken token)
     {
         var offset = 0;

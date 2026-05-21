@@ -36,7 +36,7 @@ internal static class AscfChunkCompressor
         }
     }
 
-    private static EncodedChunk Encode(byte[] rawBuffer, int rawLength, int maxCompressedSize)
+    public static EncodedChunk Encode(byte[] rawBuffer, int rawLength, int maxCompressedSize)
     {
         var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
         try
