@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
+using ASCF.Lz4;
 
 namespace ASCF;
 
@@ -77,8 +78,7 @@ internal static class AscfChunkHeaderCodec
         ReadOnlySpan<byte> source,
         AscfFileHeader fileHeader,
         int expectedChunkIndex,
-        long expectedRawOffset,
-        int maxCompressedSize)
+        long expectedRawOffset)
     {
         if (source.Length < AscfFileFormat.ChunkHeaderSize
             || BinaryPrimitives.ReadInt32LittleEndian(source[0x00..]) != AscfFileFormat.ChunkMagic
@@ -108,8 +108,7 @@ internal static class AscfChunkHeaderCodec
             storedLength,
             fileHeader,
             expectedChunkIndex,
-            expectedRawOffset,
-            maxCompressedSize);
+            expectedRawOffset);
 
         return new AscfChunkHeader(
             chunkIndex,
@@ -135,8 +134,7 @@ internal static class AscfChunkHeaderCodec
         int storedLength,
         AscfFileHeader fileHeader,
         int expectedChunkIndex,
-        long expectedRawOffset,
-        int maxCompressedSize)
+        long expectedRawOffset)
     {
         if ((flags & ~KnownFlags) != 0
             || (flags & AscfFileFormat.RequiredChunkChecksumFlags) != AscfFileFormat.RequiredChunkChecksumFlags)
@@ -172,6 +170,14 @@ internal static class AscfChunkHeaderCodec
             throw new InvalidDataException(".ascf raw chunk exceeds declared file size.");
         }
 
+        var expectedRawLength = isFinalChunk
+            ? checked((int)(fileHeader.RawSize - expectedRawOffset))
+            : fileHeader.RawChunkSize;
+        if (rawLength != expectedRawLength)
+        {
+            throw new InvalidDataException(".ascf fixed raw chunk length is invalid.");
+        }
+
         if (method == AscfFileFormat.MethodRaw)
         {
             if (storedLength != rawLength)
@@ -182,9 +188,15 @@ internal static class AscfChunkHeaderCodec
             return;
         }
 
-        if (storedLength <= 0 || storedLength > maxCompressedSize)
+        var maxStoredLength = Lz4BlockCodec.MaxCompressedLength(rawLength);
+        if (storedLength <= 0 || storedLength > maxStoredLength)
         {
             throw new InvalidDataException($"Invalid .ascf compressed chunk length {storedLength}.");
+        }
+
+        if (storedLength >= rawLength)
+        {
+            throw new InvalidDataException(".ascf compressed chunk should have been stored raw.");
         }
     }
 

@@ -8,6 +8,8 @@ namespace ASCF;
 
 public static class AscfFileWriter
 {
+    private const int IndexEntriesPerPage = 1024;
+
     [StructLayout(LayoutKind.Auto)]
     public readonly record struct WriteResult(long RawSize, long StoredSize);
 
@@ -737,18 +739,39 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
-        var entryBuffer = new byte[AscfFileFormat.IndexEntrySize];
+        var pageSize = checked(AscfFileFormat.IndexEntrySize * IndexEntriesPerPage);
+        var page = ArrayPool<byte>.Shared.Rent(pageSize);
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
-        foreach (var entry in entries)
+        try
         {
-            AscfChunkIndexCodec.WriteEntry(entryBuffer, entry);
-            indexChecksum.Append(entryBuffer);
-            await WriteBytesAsync(destination, entryBuffer, options, token).ConfigureAwait(false);
-        }
+            var used = 0;
+            foreach (var entry in entries)
+            {
+                var slot = page.AsSpan(used, AscfFileFormat.IndexEntrySize);
+                AscfChunkIndexCodec.WriteEntry(slot, entry);
+                indexChecksum.Append(slot);
+                used += AscfFileFormat.IndexEntrySize;
 
-        var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
-        var footer = AscfChunkIndexCodec.WriteFooter(entries.Count, rawSize, indexOffset, indexLength, indexChecksum.GetCurrentHashAsUInt64());
-        await WriteBytesAsync(destination, footer, options, token).ConfigureAwait(false);
+                if (used == pageSize)
+                {
+                    await WriteBytesAsync(destination, page.AsMemory(0, used), options, token).ConfigureAwait(false);
+                    used = 0;
+                }
+            }
+
+            if (used > 0)
+            {
+                await WriteBytesAsync(destination, page.AsMemory(0, used), options, token).ConfigureAwait(false);
+            }
+
+            var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
+            var footer = AscfChunkIndexCodec.WriteFooter(entries.Count, rawSize, indexOffset, indexLength, indexChecksum.GetCurrentHashAsUInt64());
+            await WriteBytesAsync(destination, footer, options, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(page);
+        }
     }
 
     private static long GetEncodedOffset(IEnumerable<AscfChunkIndexEntry> entries)

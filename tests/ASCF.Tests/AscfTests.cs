@@ -1,6 +1,8 @@
 using ASCF.Files;
 using ASCF.Lz4;
 using ASCF.Transcoding;
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Security.Cryptography;
 
 namespace ASCF.Tests;
@@ -86,6 +88,24 @@ public sealed class AscfTests : IDisposable
         var decoded = AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath));
 
         Assert.Equal(raw.Length, result.RawSize);
+        Assert.Equal(raw, decoded);
+    }
+
+    [Fact]
+    public async Task WriteFileWithPagedIndexPreservesRawBytes()
+    {
+        const int chunkCount = 1025;
+        var raw = CreateRepeatingPayload((AscfFileFormat.MinRawChunkBytes * chunkCount) + 11);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "paged-index.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes
+        };
+
+        await AscfFileWriter.WriteStoredRawFileAsync(sourcePath, 0, raw.Length, ascfPath, options, CancellationToken.None);
+        var decoded = AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath));
+
         Assert.Equal(raw, decoded);
     }
 
@@ -198,6 +218,49 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task RejectVariableSizedNonFinalRawChunk()
+    {
+        var raw = CreateIncompressiblePayload((AscfFileFormat.MinRawChunkBytes * 2) + 17);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "variable-chunk.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes
+        };
+
+        await AscfFileWriter.WriteStoredRawFileAsync(sourcePath, 0, raw.Length, ascfPath, options, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        var chunkHeader = encoded.AsSpan(AscfFileFormat.HeaderSize, AscfFileFormat.ChunkHeaderSize);
+        BinaryPrimitives.WriteInt32LittleEndian(chunkHeader[0x18..], AscfFileFormat.MinRawChunkBytes / 2);
+        RecomputeChunkHeaderChecksum(chunkHeader);
+
+        Assert.Throws<InvalidDataException>(() => AscfFileReader.DecodeToArray(encoded));
+    }
+
+    [Fact]
+    public async Task RejectCompressedChunkThatShouldHaveBeenStoredRaw()
+    {
+        var raw = new byte[(AscfFileFormat.MinRawChunkBytes * 2) + 17];
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "noncanonical-compressed.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, options, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        var chunkHeader = encoded.AsSpan(AscfFileFormat.HeaderSize, AscfFileFormat.ChunkHeaderSize);
+        var method = BinaryPrimitives.ReadUInt16LittleEndian(chunkHeader[0x0C..]);
+        Assert.NotEqual(AscfFileFormat.MethodRaw, method);
+
+        BinaryPrimitives.WriteInt32LittleEndian(chunkHeader[0x1C..], AscfFileFormat.MinRawChunkBytes);
+        RecomputeChunkHeaderChecksum(chunkHeader);
+
+        Assert.Throws<InvalidDataException>(() => AscfFileReader.DecodeToArray(encoded));
+    }
+
+    [Fact]
     public void ValidateFormatConstants()
     {
         Assert.Equal(0x46435341, AscfFileFormat.Magic);
@@ -254,6 +317,23 @@ public sealed class AscfTests : IDisposable
         var data = new byte[length];
         RandomNumberGenerator.Fill(data);
         return data;
+    }
+
+    private static byte[] CreateRepeatingPayload(int length)
+    {
+        var data = new byte[length];
+        for (var i = 0; i < data.Length; i++)
+        {
+            data[i] = (byte)i;
+        }
+
+        return data;
+    }
+
+    private static void RecomputeChunkHeaderChecksum(Span<byte> chunkHeader)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(chunkHeader[0x30..], 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(chunkHeader[0x30..], XxHash3.HashToUInt64(chunkHeader));
     }
 
     private static void ApplyUploadMask(Span<byte> buffer)
