@@ -1,3 +1,3 @@
 # ASCF
 
-the ASCF file format used in Lightless + the Lz4 compatibility dependencies.
+the ASCF file format used in [Lightless](https://git.lightless-sync.org/) + the Lz4 compatibility dependencies.
