@@ -91,6 +91,22 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task StoredRawWrappedLz4ShortcutLeavesNoPartialFileForCompressedAscf()
+    {
+        var raw = new byte[256 * 1024];
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "compressed.ascf");
+        var wrappedPath = Path.Combine(_testDirectory, "partial.llz4");
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, CancellationToken.None);
+        var result = await AscfFileReader.TryWriteStoredRawWrappedLz4Async(ascfPath, wrappedPath, CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.False(File.Exists(wrappedPath));
+        Assert.Equal(raw, AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath)));
+    }
+
+    [Fact]
     public async Task TranscodeWrappedLz4ToAscfAndBack()
     {
         var raw = CreateMixedPayload(768 * 1024 + 31);

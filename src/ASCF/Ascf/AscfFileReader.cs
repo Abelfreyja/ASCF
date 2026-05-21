@@ -379,12 +379,6 @@ public static class AscfFileReader
                     return null;
                 }
 
-                if (!await AllChunksStoredRawAsync(input, fileHeader, token).ConfigureAwait(false))
-                {
-                    return null;
-                }
-
-                input.Position = AscfFileFormat.HeaderSize;
                 var wrappedRawSize = (int)fileHeader.RawSize;
 
                 var output = new FileStream(
@@ -397,7 +391,11 @@ public static class AscfFileReader
                 await using (output.ConfigureAwait(false))
                 {
                     await WriteWrappedRawHeaderAsync(output, wrappedRawSize, token).ConfigureAwait(false);
-                    await CopyStoredRawChunksAsync(input, output, fileHeader, token).ConfigureAwait(false);
+                    if (!await TryCopyStoredRawChunksAsWrappedLz4Async(input, output, fileHeader, token).ConfigureAwait(false))
+                    {
+                        return null;
+                    }
+
                     await output.FlushAsync(token).ConfigureAwait(false);
                     success = true;
                     return new WrappedLz4FileFormat.WriteResult(fileHeader.RawSize, WrappedLz4FileFormat.HeaderSize + fileHeader.RawSize);
@@ -427,50 +425,14 @@ public static class AscfFileReader
         await output.WriteAsync(wrappedHeader.AsMemory(0, wrappedHeader.Length), token).ConfigureAwait(false);
     }
 
-    private static async Task<bool> AllChunksStoredRawAsync(FileStream input, AscfFileHeader fileHeader, CancellationToken token)
-    {
-        var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-        var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
-        long rawSize = 0;
-        long encodedOffset = AscfFileFormat.HeaderSize;
-        for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
-        {
-            await FileFormatStreamReader.ReadExactlyAsync(input, chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
-            var chunk = AscfChunkHeaderCodec.Read(chunkHeader, fileHeader, chunkIndex, rawSize, maxCompressedSize);
-
-            if (!chunk.StoresRaw)
-            {
-                return false;
-            }
-
-            entries.Add(ToIndexEntry(chunk, encodedOffset));
-            SeekForward(input, chunk.StoredLength);
-            rawSize += chunk.RawLength;
-            encodedOffset += AscfFileFormat.ChunkHeaderSize + chunk.StoredLength;
-        }
-
-        if (rawSize != fileHeader.RawSize)
-        {
-            throw new InvalidDataException(".ascf decoded raw size did not match the header.");
-        }
-
-        await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, writeWirePayload: false, token: token)
-            .ConfigureAwait(false);
-        if (input.Position != input.Length)
-        {
-            throw new InvalidDataException(".ascf file contained trailing bytes.");
-        }
-
-        return true;
-    }
-
-    private static async Task CopyStoredRawChunksAsync(Stream input, Stream output, AscfFileHeader fileHeader, CancellationToken token)
+    private static async Task<bool> TryCopyStoredRawChunksAsWrappedLz4Async(FileStream input, Stream output, AscfFileHeader fileHeader, CancellationToken token)
     {
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
         var copyBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
+        var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
         long rawSize = 0;
+        long encodedOffset = AscfFileFormat.HeaderSize;
         try
         {
             for (var chunkIndex = 0; chunkIndex < fileHeader.ChunkCount; chunkIndex++)
@@ -480,14 +442,31 @@ public static class AscfFileReader
 
                 if (!chunk.StoresRaw)
                 {
-                    throw new InvalidDataException(".ascf file changed while converting stored raw chunks.");
+                    return false;
                 }
 
                 await FileFormatStreamReader.ReadExactlyAsync(input, copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
                 ValidateStoredChecksumAndRawIfStoredRaw(chunk, copyBuffer.AsSpan(0, chunk.StoredLength));
                 await output.WriteAsync(copyBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
+
+                entries.Add(ToIndexEntry(chunk, encodedOffset));
                 rawSize += chunk.RawLength;
+                encodedOffset += AscfFileFormat.ChunkHeaderSize + chunk.StoredLength;
             }
+
+            if (rawSize != fileHeader.RawSize)
+            {
+                throw new InvalidDataException(".ascf decoded raw size did not match the header.");
+            }
+
+            await ReadAndValidateIndexAsync(input, output: null, entries, rawSize, encodedOffset, transform: null, writeWirePayload: false, token: token)
+                .ConfigureAwait(false);
+            if (input.Position != input.Length)
+            {
+                throw new InvalidDataException(".ascf file contained trailing bytes.");
+            }
+
+            return true;
         }
         finally
         {
@@ -986,16 +965,6 @@ public static class AscfFileReader
         transform?.Invoke(buffer);
 
         return true;
-    }
-
-    private static void SeekForward(FileStream input, int length)
-    {
-        if (length > input.Length - input.Position)
-        {
-            throw new EndOfStreamException();
-        }
-
-        input.Position += length;
     }
 
     private static void TryDeleteFile(string path)
