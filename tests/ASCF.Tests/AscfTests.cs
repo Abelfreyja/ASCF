@@ -104,8 +104,13 @@ public sealed class AscfTests : IDisposable
         };
 
         await AscfFileWriter.WriteStoredRawFileAsync(sourcePath, 0, raw.Length, ascfPath, options, CancellationToken.None);
+        var chunkIndex = AscfFileReader.ReadChunkIndex(ascfPath);
+        var asyncChunkIndex = await AscfFileReader.ReadChunkIndexAsync(ascfPath, CancellationToken.None);
         var decoded = AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath));
+        var expectedChunkCount = (raw.Length + AscfFileFormat.MinRawChunkBytes - 1) / AscfFileFormat.MinRawChunkBytes;
 
+        Assert.Equal(expectedChunkCount, chunkIndex.Entries.Count);
+        Assert.Equal(expectedChunkCount, asyncChunkIndex.Entries.Count);
         Assert.Equal(raw, decoded);
     }
 

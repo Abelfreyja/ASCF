@@ -668,14 +668,21 @@ public static class AscfFileReader
         long rawSize,
         long indexOffset)
     {
-        var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
-        var index = new byte[indexLength];
-        input.ReadExactly(index);
+        var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
+        Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            input.ReadExactly(entryBytes);
+            indexChecksum.Append(entryBytes);
+            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
+        }
+
         var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
         input.ReadExactly(footerBytes);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
         ValidateIndexFooter(footer, entries, rawSize, indexOffset);
-        ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
+        ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
     }
 
     private static void ReadAndValidateIndex(
@@ -685,12 +692,19 @@ public static class AscfFileReader
         long rawSize,
         long indexOffset)
     {
-        var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
-        var index = ReadSlice(encoded, ref position, indexLength);
+        var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var entryBytes = ReadSlice(encoded, ref position, AscfFileFormat.IndexEntrySize);
+            indexChecksum.Append(entryBytes);
+            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
+        }
+
         var footerBytes = ReadSlice(encoded, ref position, AscfFileFormat.IndexFooterSize);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
         ValidateIndexFooter(footer, entries, rawSize, indexOffset);
-        ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
+        ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
     }
 
     private static async Task ReadAndValidateIndexAsync(
@@ -703,22 +717,36 @@ public static class AscfFileReader
         bool writeWirePayload,
         CancellationToken token)
     {
-        var indexLength = checked(entries.Count * AscfFileFormat.IndexEntrySize);
-        var index = new byte[indexLength];
-        await ReadTransformedBytesAsync(input, index.AsMemory(0, index.Length), transform, token).ConfigureAwait(false);
+        if (writeWirePayload)
+        {
+            ArgumentNullException.ThrowIfNull(output);
+        }
+
+        var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
+        var entryBytes = new byte[AscfFileFormat.IndexEntrySize];
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        for (var i = 0; i < entries.Count; i++)
+        {
+            await ReadTransformedBytesAsync(input, entryBytes.AsMemory(0, entryBytes.Length), transform, token).ConfigureAwait(false);
+            indexChecksum.Append(entryBytes);
+            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
+
+            if (writeWirePayload)
+            {
+                await output!.WriteAsync(entryBytes.AsMemory(0, entryBytes.Length), token).ConfigureAwait(false);
+            }
+        }
 
         var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
         await ReadTransformedBytesAsync(input, footerBytes.AsMemory(0, footerBytes.Length), transform, token).ConfigureAwait(false);
 
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
         ValidateIndexFooter(footer, entries, rawSize, indexOffset);
-        ValidateIndexEntries(AscfChunkIndexCodec.ReadIndex(index, footer), entries);
+        ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
 
         if (writeWirePayload)
         {
-            ArgumentNullException.ThrowIfNull(output);
-            await output.WriteAsync(index.AsMemory(0, index.Length), token).ConfigureAwait(false);
-            await output.WriteAsync(footerBytes.AsMemory(0, footerBytes.Length), token).ConfigureAwait(false);
+            await output!.WriteAsync(footerBytes.AsMemory(0, footerBytes.Length), token).ConfigureAwait(false);
         }
     }
 
@@ -736,9 +764,7 @@ public static class AscfFileReader
         ValidateFooterAgainstHeader(footer, fileHeader);
 
         input.Position = footer.IndexOffset;
-        var index = new byte[checked((int)footer.IndexLength)];
-        input.ReadExactly(index);
-        var chunkIndex = AscfChunkIndexCodec.ReadIndex(index, footer);
+        var chunkIndex = ReadChunkIndexEntries(input, footer);
         ValidateIndexRawSize(chunkIndex, fileHeader.RawSize);
         return chunkIndex;
     }
@@ -757,11 +783,41 @@ public static class AscfFileReader
         ValidateFooterAgainstHeader(footer, fileHeader);
 
         input.Position = footer.IndexOffset;
-        var index = new byte[checked((int)footer.IndexLength)];
-        await input.ReadExactlyAsync(index.AsMemory(0, index.Length), token).ConfigureAwait(false);
-        var chunkIndex = AscfChunkIndexCodec.ReadIndex(index, footer);
+        var chunkIndex = await ReadChunkIndexEntriesAsync(input, footer, token).ConfigureAwait(false);
         ValidateIndexRawSize(chunkIndex, fileHeader.RawSize);
         return chunkIndex;
+    }
+
+    private static AscfChunkIndex ReadChunkIndexEntries(Stream input, AscfIndexFooter footer)
+    {
+        var entries = new AscfChunkIndexEntry[footer.ChunkCount];
+        Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        for (var i = 0; i < entries.Length; i++)
+        {
+            input.ReadExactly(entryBytes);
+            indexChecksum.Append(entryBytes);
+            entries[i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+        }
+
+        ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
+        return new AscfChunkIndex(entries);
+    }
+
+    private static async Task<AscfChunkIndex> ReadChunkIndexEntriesAsync(FileStream input, AscfIndexFooter footer, CancellationToken token)
+    {
+        var entries = new AscfChunkIndexEntry[footer.ChunkCount];
+        var entryBytes = new byte[AscfFileFormat.IndexEntrySize];
+        var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
+        for (var i = 0; i < entries.Length; i++)
+        {
+            await input.ReadExactlyAsync(entryBytes.AsMemory(0, entryBytes.Length), token).ConfigureAwait(false);
+            indexChecksum.Append(entryBytes);
+            entries[i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+        }
+
+        ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
+        return new AscfChunkIndex(entries);
     }
 
     private static async Task<AscfPartialValidationResult> ValidatePartialChunksAsync(
@@ -885,19 +941,19 @@ public static class AscfFileReader
         }
     }
 
-    private static void ValidateIndexEntries(AscfChunkIndex index, List<AscfChunkIndexEntry> expected)
+    private static void ValidateIndexEntry(AscfChunkIndexEntry actual, AscfChunkIndexEntry expected)
     {
-        if (index.Entries.Count != expected.Count)
+        if (!actual.Equals(expected))
         {
-            throw new InvalidDataException(".ascf index entry count mismatch.");
+            throw new InvalidDataException(".ascf index entry mismatch.");
         }
+    }
 
-        for (var i = 0; i < expected.Count; i++)
+    private static void ValidateIndexChecksum(AscfIndexFooter footer, ulong indexChecksum)
+    {
+        if (footer.IndexChecksum != indexChecksum)
         {
-            if (!index.Entries[i].Equals(expected[i]))
-            {
-                throw new InvalidDataException(".ascf index entry mismatch.");
-            }
+            throw new InvalidDataException(".ascf index checksum mismatch.");
         }
     }
 

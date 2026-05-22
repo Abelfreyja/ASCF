@@ -151,7 +151,7 @@ internal static class AscfChunkIndexCodec
         BinaryPrimitives.WriteUInt64LittleEndian(destination[0x30..], ComputeEntryChecksum(destination));
     }
 
-    private static AscfChunkIndexEntry ReadEntry(ReadOnlySpan<byte> source)
+    internal static AscfChunkIndexEntry ReadEntry(ReadOnlySpan<byte> source)
     {
         if (source.Length < AscfFileFormat.IndexEntrySize
             || BinaryPrimitives.ReadUInt16LittleEndian(source[0x06..]) != AscfFileFormat.RequiredChunkChecksumFlags
