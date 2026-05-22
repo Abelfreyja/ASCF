@@ -7,7 +7,7 @@ public static class AscfFileFormat
     //
     //       +0x0000 +--------------------------------+
     //               | file header          ASCF      |
-    //               | 80 bytes                       |
+    //               | 160 bytes                      |
     //               +--------------------------------+
     //               | chunk header         ASCH      |
     //               | 64 bytes                       |
@@ -35,18 +35,30 @@ public static class AscfFileFormat
     public const int Magic = 0x46435341; // ASCF
     public const int ChunkMagic = 0x48435341; // ASCH
     public const int Version = 1;
-    public const int HeaderSize = 80;
+
+    public const int HeaderSize = 160;
     public const int ChunkHeaderSize = 64;
     public const int IndexEntrySize = 64;
     public const int IndexFooterSize = 64;
+    public const int Sha1HashSize = 20;
+    public const int Blake3HashSize = 32;
+
     public const int DefaultRawChunkBytes = 1024 * 1024;
     public const int MinRawChunkBytes = 16 * 1024;
     public const int MaxRawChunkBytes = 16 * 1024 * 1024;
     public const int DefaultBufferSize = 81920;
     public const int DefaultMaxInMemoryDecodeBytes = 512 * 1024 * 1024;
     public const long DefaultMaxRawFileBytes = 32L * 1024 * 1024 * 1024;
-    public const int MaxCompressionWorkerCount = 64;
-    public static int DefaultCompressionWorkerCount { get; } = Math.Clamp(Math.Max(1, Environment.ProcessorCount) / 2, 1, 16);
+    public const long DefaultMaxCompressionPipelineBytes = 128L * 1024 * 1024;
+
+    public const int AutoWorkerCount = 0;
+    public const int DefaultAutoWorkerCountLimit = 16;
+    public const int DefaultMaxCompressionWorkerCount = 64;
+    public const int DefaultMaxParallelDecodeWorkerCount = 64;
+    public const int MaxCompressionWorkerCount = DefaultMaxCompressionWorkerCount;
+    public const int MaxParallelDecodeWorkerCount = DefaultMaxParallelDecodeWorkerCount;
+    public static int DefaultCompressionWorkerCount { get; } = GetDefaultWorkerCount(DefaultMaxCompressionWorkerCount);
+    public static int DefaultParallelDecodeWorkerCount { get; } = GetDefaultWorkerCount(DefaultMaxParallelDecodeWorkerCount);
 
     public const int HeaderFlagChunkIndexPresent = 1;
     public const int HeaderFlagFixedRawChunkingRequired = 1 << 1;
@@ -58,6 +70,9 @@ public static class AscfFileFormat
     public const int ChunkFlagFinalChunk = 1 << 2;
 
     public const int ChecksumKindXxHash3 = 1;
+    public const int RawHashAlgorithmSha1 = 1;
+    public const int RawHashAlgorithmBlake3 = 1 << 1;
+    public const int SupportedRawHashAlgorithms = RawHashAlgorithmSha1 | RawHashAlgorithmBlake3;
 
     public const int MethodRaw = 0;
     public const int MethodLz4Fast = 1;
@@ -85,5 +100,16 @@ public static class AscfFileFormat
         return rawSize == 0
             ? 0
             : checked((int)((rawSize + rawChunkSize - 1) / rawChunkSize));
+    }
+
+    public static int GetDefaultWorkerCount(int maxWorkerCount)
+    {
+        if (maxWorkerCount <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxWorkerCount), maxWorkerCount, "Maximum worker count must be positive.");
+        }
+
+        var defaultLimit = Math.Min(DefaultAutoWorkerCountLimit, maxWorkerCount);
+        return Math.Clamp(Math.Max(1, Environment.ProcessorCount) / 2, 1, defaultLimit);
     }
 }

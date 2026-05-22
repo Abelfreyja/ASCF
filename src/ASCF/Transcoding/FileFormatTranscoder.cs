@@ -9,7 +9,7 @@ public static class FileFormatTranscoder
     public readonly record struct ConvertResult(long RawSize, long StoredSize);
 
     [StructLayout(LayoutKind.Auto)]
-    public readonly record struct ConvertHashResult(string Hash, long RawSize, long StoredSize, Lz4PayloadFormat Format);
+    public readonly record struct ConvertHashResult(AscfRawHashes Hashes, long RawSize, long StoredSize, Lz4PayloadFormat Format);
 
     public enum Lz4PayloadFormat
     {
@@ -81,15 +81,6 @@ public static class FileFormatTranscoder
         return new ConvertResult(rawSize, storedSize);
     }
 
-    public static Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
-        string lz4Path,
-        long lz4Length,
-        string rawTempPath,
-        string ascfTempPath,
-        int streamBufferSize,
-        CancellationToken token)
-        => ConvertLz4PayloadToAscfWithHashAsync(lz4Path, lz4Length, rawTempPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token);
-
     public static async Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
         string lz4Path,
         long lz4Length,
@@ -104,20 +95,13 @@ public static class FileFormatTranscoder
         {
             var wrapped = await ConvertWrappedLz4ToAscfWithHashAsync(lz4Path, header, rawTempPath, ascfTempPath, options, token)
                 .ConfigureAwait(false);
-            return new ConvertHashResult(wrapped.Hash, wrapped.RawSize, wrapped.StoredSize, Lz4PayloadFormat.WrappedLz4);
+            return new ConvertHashResult(wrapped.Hashes, wrapped.RawSize, wrapped.StoredSize, Lz4PayloadFormat.WrappedLz4);
         }
 
         var stream = await ConvertLz4StreamToAscfWithHashAsync(lz4Path, ascfTempPath, streamBufferSize, options, token)
             .ConfigureAwait(false);
-        return new ConvertHashResult(stream.Hash, stream.RawSize, stream.StoredSize, Lz4PayloadFormat.Lz4Stream);
+        return new ConvertHashResult(stream.Hashes, stream.RawSize, stream.StoredSize, Lz4PayloadFormat.Lz4Stream);
     }
-
-    public static Task<ConvertHashResult> ConvertWrappedLz4ToAscfWithHashAsync(
-        string wrappedPath,
-        string rawTempPath,
-        string ascfTempPath,
-        CancellationToken token)
-        => ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, rawTempPath, ascfTempPath, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertHashResult> ConvertWrappedLz4ToAscfWithHashAsync(
         string wrappedPath,
@@ -137,15 +121,8 @@ public static class FileFormatTranscoder
             ?? throw new InvalidDataException("Wrapped LZ4 header is invalid.");
         var result = await ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, header, rawTempPath, ascfTempPath, options, token)
             .ConfigureAwait(false);
-        return new ConvertHashResult(result.Hash, result.RawSize, result.StoredSize, Lz4PayloadFormat.WrappedLz4);
+        return new ConvertHashResult(result.Hashes, result.RawSize, result.StoredSize, Lz4PayloadFormat.WrappedLz4);
     }
-
-    public static Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
-        string streamPath,
-        string ascfTempPath,
-        int streamBufferSize,
-        CancellationToken token)
-        => ConvertLz4StreamToAscfWithHashAsync(streamPath, ascfTempPath, streamBufferSize, FileFormatTranscodeOptions.Default, token);
 
     public static async Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
         string streamPath,
@@ -157,7 +134,7 @@ public static class FileFormatTranscoder
         options.Validate();
         var result = await Lz4StreamFormat.ConvertToAscfFileWithHashAsync(streamPath, ascfTempPath, streamBufferSize, options.AscfWriter, token)
             .ConfigureAwait(false);
-        return new ConvertHashResult(result.Hash, result.RawSize, result.StoredSize, Lz4PayloadFormat.Lz4Stream);
+        return new ConvertHashResult(result.Hashes, result.RawSize, result.StoredSize, Lz4PayloadFormat.Lz4Stream);
     }
 
     public static Task<ConvertResult> ConvertLz4StreamToAscfAsync(

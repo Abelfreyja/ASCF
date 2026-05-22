@@ -31,13 +31,6 @@ public static class Lz4StreamFormat
         }
     }
 
-    public static Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
-        string compressedPath,
-        string outputPath,
-        int streamBufferSize,
-        CancellationToken token)
-        => ConvertToAscfFileWithHashAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token);
-
     public static async Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
         string compressedPath,
         string outputPath,

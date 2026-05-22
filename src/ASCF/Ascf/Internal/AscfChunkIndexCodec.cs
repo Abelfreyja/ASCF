@@ -67,28 +67,6 @@ internal static class AscfChunkIndexCodec
     //      +0x40  +------------------------------+
     //
 
-    public static AscfChunkIndex ReadIndex(ReadOnlySpan<byte> index, AscfIndexFooter footer)
-    {
-        if (index.Length != footer.IndexLength || index.Length % AscfFileFormat.IndexEntrySize != 0)
-        {
-            throw new InvalidDataException(".ascf index length is invalid.");
-        }
-
-        var checksum = AscfChecksum.ComputeXxHash3(index);
-        if (checksum != footer.IndexChecksum)
-        {
-            throw new InvalidDataException(".ascf index checksum mismatch.");
-        }
-
-        var entries = new AscfChunkIndexEntry[footer.ChunkCount];
-        for (var i = 0; i < entries.Length; i++)
-        {
-            entries[i] = ReadEntry(index.Slice(i * AscfFileFormat.IndexEntrySize, AscfFileFormat.IndexEntrySize));
-        }
-
-        return new AscfChunkIndex(entries);
-    }
-
     public static byte[] WriteFooter(int chunkCount, long rawSize, long indexOffset, long indexLength, ulong indexChecksum)
     {
         var footer = new byte[AscfFileFormat.IndexFooterSize];
@@ -124,11 +102,23 @@ internal static class AscfChunkIndexCodec
         var indexOffset = BinaryPrimitives.ReadInt64LittleEndian(footer[0x20..]);
         var indexLength = BinaryPrimitives.ReadInt64LittleEndian(footer[0x28..]);
         var indexChecksum = BinaryPrimitives.ReadUInt64LittleEndian(footer[0x30..]);
+        long expectedIndexLength;
+        long expectedFileLength;
+        try
+        {
+            expectedIndexLength = checked((long)chunkCount * AscfFileFormat.IndexEntrySize);
+            expectedFileLength = checked(indexOffset + indexLength + AscfFileFormat.IndexFooterSize);
+        }
+        catch (OverflowException exception)
+        {
+            throw new InvalidDataException(".ascf index footer length fields overflow.", exception);
+        }
+
         if (chunkCount < 0
             || rawSize < 0
             || indexOffset < AscfFileFormat.HeaderSize
-            || indexLength != checked((long)chunkCount * AscfFileFormat.IndexEntrySize)
-            || indexOffset + indexLength + AscfFileFormat.IndexFooterSize != fileLength)
+            || indexLength != expectedIndexLength
+            || expectedFileLength != fileLength)
         {
             throw new InvalidDataException(".ascf index footer length fields are invalid.");
         }

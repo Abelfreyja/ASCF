@@ -10,6 +10,17 @@ public sealed record AscfReaderOptions
     public long MaxRawFileBytes { get; init; } = AscfFileFormat.DefaultMaxRawFileBytes;
     public int MaxInMemoryDecodeBytes { get; init; } = AscfFileFormat.DefaultMaxInMemoryDecodeBytes;
     public int BufferSize { get; init; } = AscfFileFormat.DefaultBufferSize;
+    public int ParallelDecodeWorkerCount { get; init; } = AscfFileFormat.AutoWorkerCount;
+    public int MaxParallelDecodeWorkerCount { get; init; } = AscfFileFormat.DefaultMaxParallelDecodeWorkerCount;
+    public AscfParallelDecodeMode ParallelDecodeMode { get; init; } = AscfParallelDecodeMode.Auto;
+    public AscfRawHashAlgorithms ResultHashAlgorithms { get; init; } = AscfRawHashAlgorithms.Sha1;
+
+    internal int GetParallelDecodeWorkerCount()
+        => FileFormatWorkerCounts.Resolve(
+            ParallelDecodeWorkerCount,
+            MaxParallelDecodeWorkerCount,
+            nameof(ParallelDecodeWorkerCount),
+            nameof(MaxParallelDecodeWorkerCount));
 
     internal void Validate()
     {
@@ -24,5 +35,32 @@ public sealed record AscfReaderOptions
         }
 
         FileFormatBuffers.ValidateBufferSize(BufferSize, nameof(BufferSize));
+        ValidateParallelDecodeMode(ParallelDecodeMode);
+        ValidateResultHashAlgorithms(ResultHashAlgorithms);
+        GetParallelDecodeWorkerCount();
     }
+
+    internal AscfParallelDecodeMode ResolveParallelDecodeMode(bool computeHash)
+    {
+        if (ParallelDecodeMode == AscfParallelDecodeMode.Auto)
+        {
+            return computeHash ? AscfParallelDecodeMode.OrderedWrite : AscfParallelDecodeMode.RandomWrite;
+        }
+
+        return ParallelDecodeMode;
+    }
+
+    internal AscfRawHashAlgorithms GetResultHashAlgorithms()
+        => ResultHashAlgorithms;
+
+    private static void ValidateParallelDecodeMode(AscfParallelDecodeMode mode)
+    {
+        if (mode is not AscfParallelDecodeMode.Auto and not AscfParallelDecodeMode.OrderedWrite and not AscfParallelDecodeMode.RandomWrite)
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Parallel decode mode is not supported.");
+        }
+    }
+
+    private static void ValidateResultHashAlgorithms(AscfRawHashAlgorithms algorithms)
+        => AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(ResultHashAlgorithms));
 }

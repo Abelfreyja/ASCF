@@ -10,15 +10,19 @@ internal readonly record struct AscfFileHeader(
     int RawChunkSize,
     int ChunkCount,
     Guid StreamId,
-    long EncodedSize);
+    long EncodedSize,
+    AscfRawHashBytes RawHashes);
 
 internal static class AscfFileHeaderCodec
 {
-    private const int HeaderChecksumOffset = 0x48;
+    private const int RawHashAlgorithmsOffset = 0x48;
+    private const int Sha1HashOffset = 0x50;
+    private const int Blake3HashOffset = 0x70;
+    private const int HeaderChecksumOffset = 0x98;
     private const int KnownFlags = AscfFileFormat.RequiredHeaderFlags;
 
     //
-    //  file header, 80 bytes
+    //  file header, 160 bytes
     //
     //      +0x00  +------------------------------+
     //             | magic               ASCF     | u32
@@ -51,11 +55,30 @@ internal static class AscfFileHeaderCodec
     //      +0x40  +------------------------------+
     //             | encoded size                 | i64
     //      +0x48  +------------------------------+
-    //             | header checksum              | u64
+    //             | raw hash algorithms          | u32
+    //      +0x4c  +------------------------------+
+    //             | reserved                     | u32
     //      +0x50  +------------------------------+
+    //             | raw SHA-1                    | 20 bytes
+    //      +0x64  +------------------------------+
+    //             | reserved                     | 12 bytes
+    //      +0x70  +------------------------------+
+    //             | raw BLAKE3                   | 32 bytes
+    //      +0x90  +------------------------------+
+    //             | reserved                     | u64
+    //      +0x98  +------------------------------+
+    //             | header checksum              | u64
+    //      +0xa0  +------------------------------+
     //
 
-    public static void Write(Span<byte> destination, long rawSize, int rawChunkSize, int chunkCount, Guid streamId, long encodedSize)
+    public static void Write(
+        Span<byte> destination,
+        long rawSize,
+        int rawChunkSize,
+        int chunkCount,
+        Guid streamId,
+        long encodedSize,
+        AscfRawHashBytes rawHashes)
     {
         destination.Clear();
         BinaryPrimitives.WriteInt32LittleEndian(destination[0x00..], AscfFileFormat.Magic);
@@ -72,6 +95,18 @@ internal static class AscfFileHeaderCodec
         BinaryPrimitives.WriteInt32LittleEndian(destination[0x28..], AscfFileFormat.SupportedMethodMask);
         _ = streamId.TryWriteBytes(destination.Slice(0x30, 16));
         BinaryPrimitives.WriteInt64LittleEndian(destination[0x40..], encodedSize);
+        ValidateRawHashLengths(rawHashes);
+        BinaryPrimitives.WriteInt32LittleEndian(destination[RawHashAlgorithmsOffset..], (int)rawHashes.Algorithms);
+        if (rawHashes.Sha1 != null)
+        {
+            rawHashes.Sha1.CopyTo(destination.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize));
+        }
+
+        if (rawHashes.Blake3 != null)
+        {
+            rawHashes.Blake3.CopyTo(destination.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize));
+        }
+
         BinaryPrimitives.WriteUInt64LittleEndian(destination[HeaderChecksumOffset..], ComputeHeaderChecksum(destination));
     }
 
@@ -124,7 +159,15 @@ internal static class AscfFileHeaderCodec
             return false;
         }
 
+        if (!TryReadRawHashes(source, out var rawHashes))
+        {
+            return false;
+        }
+
         if (BinaryPrimitives.ReadInt32LittleEndian(source[0x2C..]) != 0
+            || BinaryPrimitives.ReadInt32LittleEndian(source[0x4C..]) != 0
+            || !ReservedBytesAreZero(source.Slice(0x64, 12))
+            || BinaryPrimitives.ReadInt64LittleEndian(source[0x90..]) != 0
             || !HeaderChecksumMatches(source))
         {
             return false;
@@ -137,7 +180,7 @@ internal static class AscfFileHeaderCodec
             return false;
         }
 
-        header = new AscfFileHeader(rawSize, flags, rawChunkSize, chunkCount, streamId, encodedSize);
+        header = new AscfFileHeader(rawSize, flags, rawChunkSize, chunkCount, streamId, encodedSize, rawHashes);
         return true;
     }
 
@@ -156,4 +199,63 @@ internal static class AscfFileHeaderCodec
 
     private static ulong ComputeHeaderChecksum(Span<byte> header)
         => AscfChecksum.ComputeXxHash3WithZeroedField(header, HeaderChecksumOffset);
+
+    private static bool TryReadRawHashes(ReadOnlySpan<byte> source, out AscfRawHashBytes rawHashes)
+    {
+        rawHashes = default;
+        var algorithms = (AscfRawHashAlgorithms)BinaryPrimitives.ReadInt32LittleEndian(source[RawHashAlgorithmsOffset..]);
+        if (!AscfRawHashAlgorithmFlags.IsSupported(algorithms))
+        {
+            return false;
+        }
+
+        byte[]? sha1 = null;
+        if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Sha1))
+        {
+            sha1 = source.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize).ToArray();
+        }
+        else if (!ReservedBytesAreZero(source.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize)))
+        {
+            return false;
+        }
+
+        byte[]? blake3 = null;
+        if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Blake3))
+        {
+            blake3 = source.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize).ToArray();
+        }
+        else if (!ReservedBytesAreZero(source.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize)))
+        {
+            return false;
+        }
+
+        rawHashes = new AscfRawHashBytes(sha1, blake3);
+        return true;
+    }
+
+    private static void ValidateRawHashLengths(AscfRawHashBytes rawHashes)
+    {
+        if (rawHashes.Sha1 is { Length: not AscfFileFormat.Sha1HashSize })
+        {
+            throw new ArgumentException("SHA-1 hash length is invalid.", nameof(rawHashes));
+        }
+
+        if (rawHashes.Blake3 is { Length: not AscfFileFormat.Blake3HashSize })
+        {
+            throw new ArgumentException("BLAKE3 hash length is invalid.", nameof(rawHashes));
+        }
+    }
+
+    private static bool ReservedBytesAreZero(ReadOnlySpan<byte> source)
+    {
+        foreach (var value in source)
+        {
+            if (value != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
