@@ -57,7 +57,8 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         long storedSize;
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+        var preallocationSize = GetSourceFilePreallocationSize(sourcePath, options);
+        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
         await using (output.ConfigureAwait(false))
         {
             await WriteFileAsync(sourcePath, output, options, token).ConfigureAwait(false);
@@ -75,7 +76,8 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         HashedWriteResult writeResult;
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+        var preallocationSize = GetSourceFilePreallocationSize(sourcePath, options);
+        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
         await using (output.ConfigureAwait(false))
         {
             var result = await WriteFileToStreamWithHashAsync(sourcePath, output, options, token).ConfigureAwait(false);
@@ -212,7 +214,8 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         (long RawSize, long StoredSize, AscfRawHashBytes RawHashes) result;
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+        var preallocationSize = GetSeekableStreamPreallocationSize(source, options);
+        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
         await using (output.ConfigureAwait(false))
         using (var hasher = CreateRawHasher(options.RawHashAlgorithms | requiredHashAlgorithms))
         {
@@ -308,7 +311,8 @@ public static class AscfFileWriter
         {
             source.Position = sourceOffset;
 
-            var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+            var preallocationSize = GetMaxEncodedSize(rawLength, options.RawChunkSize);
+            var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
             await using (output.ConfigureAwait(false))
             {
                 using var hasher = CreateRawHasher(options.RawHashAlgorithms | requiredHashAlgorithms);
@@ -1076,6 +1080,36 @@ public static class AscfFileWriter
 
     private static AscfRawHashes GetResultHashes(AscfRawHashBytes rawHashes, AscfRawHashAlgorithms algorithms)
         => rawHashes.Filter(algorithms).ToPublic();
+
+    private static long GetSourceFilePreallocationSize(string sourcePath, AscfWriterOptions options)
+    {
+        var sourceInfo = new FileInfo(sourcePath);
+        ValidateRawSize(sourceInfo.Length, options.MaxRawFileBytes);
+        return GetMaxEncodedSize(sourceInfo.Length, options.RawChunkSize);
+    }
+
+    private static long GetSeekableStreamPreallocationSize(Stream source, AscfWriterOptions options)
+    {
+        if (!source.CanSeek)
+        {
+            return 0;
+        }
+
+        var rawSize = Math.Max(0, checked(source.Length - source.Position));
+        ValidateRawSize(rawSize, options.MaxRawFileBytes);
+        return GetMaxEncodedSize(rawSize, options.RawChunkSize);
+    }
+
+    private static long GetMaxEncodedSize(long rawSize, int rawChunkSize)
+    {
+        var chunkCount = AscfFileFormat.GetChunkCount(rawSize, rawChunkSize);
+        return checked(
+            AscfFileFormat.HeaderSize
+            + rawSize
+            + ((long)chunkCount * AscfFileFormat.ChunkHeaderSize)
+            + ((long)chunkCount * AscfFileFormat.IndexEntrySize)
+            + AscfFileFormat.IndexFooterSize);
+    }
 
     private static async ValueTask WriteBytesAsync(Stream destination, ReadOnlyMemory<byte> buffer, WriteOptions options, CancellationToken token)
     {

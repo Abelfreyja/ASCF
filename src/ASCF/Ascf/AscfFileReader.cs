@@ -297,16 +297,20 @@ public static class AscfFileReader
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
         StoredStreamResult storedResult;
 
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+        var header = new byte[AscfFileFormat.HeaderSize];
+        var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
+        await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
+        var fileHeader = ValidateHeader(
+            header,
+            options,
+            encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
+
+        var output = FileFormatPaths.OpenSequentialStagingWrite(
+            stagedFile.StagingPath,
+            options.BufferSize,
+            GetEncodedPreallocationSize(fileHeader));
         await using (output.ConfigureAwait(false))
         {
-            var header = new byte[AscfFileFormat.HeaderSize];
-            var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
-            await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
-            var fileHeader = ValidateHeader(
-                header,
-                options,
-                encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
             using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
             await output.WriteAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
 
@@ -511,7 +515,7 @@ public static class AscfFileReader
         bool computeHash,
         CancellationToken token)
     {
-        var output = FileFormatPaths.OpenRandomStagingReadWrite(outputPath, options.BufferSize);
+        var output = FileFormatPaths.OpenRandomStagingReadWrite(outputPath, options.BufferSize, fileHeader.RawSize);
         await using (output.ConfigureAwait(false))
         {
             output.SetLength(fileHeader.RawSize);
@@ -546,7 +550,7 @@ public static class AscfFileReader
         bool computeHash,
         CancellationToken token)
     {
-        var output = FileFormatPaths.OpenSequentialStagingWrite(outputPath, options.BufferSize);
+        var output = FileFormatPaths.OpenSequentialStagingWrite(outputPath, options.BufferSize, fileHeader.RawSize);
         await using (output.ConfigureAwait(false))
         {
             output.SetLength(fileHeader.RawSize);
@@ -601,7 +605,10 @@ public static class AscfFileReader
 
             var wrappedRawSize = (int)fileHeader.RawSize;
 
-            var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+            var output = FileFormatPaths.OpenSequentialStagingWrite(
+                stagedFile.StagingPath,
+                options.BufferSize,
+                (long)WrappedLz4FileFormat.HeaderSize + fileHeader.RawSize);
             await using (output.ConfigureAwait(false))
             {
                 await WriteWrappedRawHeaderAsync(output, wrappedRawSize, token).ConfigureAwait(false);
@@ -780,16 +787,17 @@ public static class AscfFileReader
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
         DecodeFileResult decodedResult;
 
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize);
+        var header = new byte[AscfFileFormat.HeaderSize];
+        var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
+        await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
+        var fileHeader = ValidateHeader(
+            header,
+            options,
+            encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
+
+        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, fileHeader.RawSize);
         await using (output.ConfigureAwait(false))
         {
-            var header = new byte[AscfFileFormat.HeaderSize];
-            var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
-            await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
-            var fileHeader = ValidateHeader(
-                header,
-                options,
-                encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
             using var hasher = computeHash ? CreateRawHasher(GetHashAlgorithms(fileHeader, options)) : null;
 
             var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
@@ -953,6 +961,9 @@ public static class AscfFileReader
             throw new InvalidDataException(".ascf encoded size does not match file length.");
         }
     }
+
+    private static long GetEncodedPreallocationSize(AscfFileHeader header)
+        => header.EncodedSize > 0 ? header.EncodedSize : 0;
 
     private static bool PartialEncodedSizeExceeded(AscfFileHeader header, long partialLength)
         => header.EncodedSize != 0 && partialLength > header.EncodedSize;

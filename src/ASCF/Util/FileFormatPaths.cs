@@ -5,23 +5,21 @@ internal static class FileFormatPaths
     public static StagedFile CreateStagedFile(string outputPath)
         => new(outputPath, CreateStagingPath(outputPath));
 
-    public static FileStream OpenSequentialStagingWrite(string stagingPath, int bufferSize)
-        => new(
+    public static FileStream OpenSequentialStagingWrite(string stagingPath, int bufferSize, long preallocationSize = 0)
+        => OpenStagingWrite(
             stagingPath,
-            FileMode.CreateNew,
             FileAccess.Write,
-            FileShare.None,
             bufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+            FileOptions.Asynchronous | FileOptions.SequentialScan,
+            preallocationSize);
 
-    public static FileStream OpenRandomStagingReadWrite(string stagingPath, int bufferSize)
-        => new(
+    public static FileStream OpenRandomStagingReadWrite(string stagingPath, int bufferSize, long preallocationSize = 0)
+        => OpenStagingWrite(
             stagingPath,
-            FileMode.CreateNew,
             FileAccess.ReadWrite,
-            FileShare.None,
             bufferSize,
-            FileOptions.Asynchronous | FileOptions.RandomAccess);
+            FileOptions.Asynchronous | FileOptions.RandomAccess,
+            preallocationSize);
 
     public static void EnsureOutputDirectory(string outputPath)
     {
@@ -45,6 +43,32 @@ internal static class FileFormatPaths
         }
 
         return Path.Combine(directory, $".{fileName}.{Guid.NewGuid():N}.tmp");
+    }
+
+    private static FileStream OpenStagingWrite(
+        string stagingPath,
+        FileAccess access,
+        int bufferSize,
+        FileOptions options,
+        long preallocationSize)
+    {
+        FileFormatBuffers.ValidateBufferSize(bufferSize, nameof(bufferSize));
+        if (preallocationSize < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(preallocationSize), preallocationSize, "Preallocation size must be non-negative.");
+        }
+
+        return new FileStream(
+            stagingPath,
+            new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = access,
+                Share = FileShare.None,
+                BufferSize = bufferSize,
+                Options = options,
+                PreallocationSize = preallocationSize
+            });
     }
 
     private static void CommitStagedFile(string stagingPath, string outputPath)
