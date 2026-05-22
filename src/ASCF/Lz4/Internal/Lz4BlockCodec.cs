@@ -5,8 +5,6 @@ namespace ASCF.Lz4;
 
 internal static unsafe class Lz4BlockCodec
 {
-    private const int DirectHighCompressionMaxBytes = 64 * 1024;
-
     [StructLayout(LayoutKind.Auto)]
     public readonly record struct EncodedBlock(int RawLength, int StoredLength)
     {
@@ -21,7 +19,7 @@ internal static unsafe class Lz4BlockCodec
 
     public static EncodedBlock Encode(ReadOnlySpan<byte> raw, Span<byte> compressedDestination)
     {
-        var encodedLength = LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L09_HC);
+        var encodedLength = LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L08_HC);
         return new EncodedBlock(raw.Length, ShouldStoreRaw(encodedLength, raw.Length) ? raw.Length : encodedLength);
     }
 
@@ -44,7 +42,7 @@ internal static unsafe class Lz4BlockCodec
 
     public static EncodedBlock EncodeOrCopyRaw(byte* raw, int rawLength, byte* destination, int destinationLength)
     {
-        var encodedLength = LZ4Codec.Encode(raw, rawLength, destination, destinationLength, LZ4Level.L09_HC);
+        var encodedLength = LZ4Codec.Encode(raw, rawLength, destination, destinationLength, LZ4Level.L08_HC);
         if (!ShouldStoreRaw(encodedLength, rawLength))
         {
             return new EncodedBlock(rawLength, encodedLength);
@@ -76,13 +74,8 @@ internal static unsafe class Lz4BlockCodec
 
     private static bool ShouldUseHighCompressionDirectly(ReadOnlySpan<byte> raw)
     {
-        if (raw.Length < DirectHighCompressionMaxBytes)
-        {
-            return true;
-        }
-
         var first = raw[0];
-        var step = raw.Length / 16;
+        var step = Math.Max(1, raw.Length / 16);
         for (var i = step; i < raw.Length; i += step)
         {
             if (raw[i] != first)

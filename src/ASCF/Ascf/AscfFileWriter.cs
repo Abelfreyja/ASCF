@@ -1085,7 +1085,7 @@ public static class AscfFileWriter
     {
         var sourceInfo = new FileInfo(sourcePath);
         ValidateRawSize(sourceInfo.Length, options.MaxRawFileBytes);
-        return GetMaxEncodedSize(sourceInfo.Length, options.RawChunkSize);
+        return 0;
     }
 
     private static long GetSeekableStreamPreallocationSize(Stream source, AscfWriterOptions options)
@@ -1097,7 +1097,7 @@ public static class AscfFileWriter
 
         var rawSize = Math.Max(0, checked(source.Length - source.Position));
         ValidateRawSize(rawSize, options.MaxRawFileBytes);
-        return GetMaxEncodedSize(rawSize, options.RawChunkSize);
+        return 0;
     }
 
     private static long GetMaxEncodedSize(long rawSize, int rawChunkSize)

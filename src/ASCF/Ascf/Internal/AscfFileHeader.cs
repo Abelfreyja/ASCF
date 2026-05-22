@@ -95,16 +95,16 @@ internal static class AscfFileHeaderCodec
         BinaryPrimitives.WriteInt32LittleEndian(destination[0x28..], AscfFileFormat.SupportedMethodMask);
         _ = streamId.TryWriteBytes(destination.Slice(0x30, 16));
         BinaryPrimitives.WriteInt64LittleEndian(destination[0x40..], encodedSize);
-        ValidateRawHashLengths(rawHashes);
+        ValidateRawHashAlgorithms(rawHashes);
         BinaryPrimitives.WriteInt32LittleEndian(destination[RawHashAlgorithmsOffset..], (int)rawHashes.Algorithms);
-        if (rawHashes.Sha1 != null)
+        if (rawHashes.HasSha1)
         {
-            rawHashes.Sha1.CopyTo(destination.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize));
+            rawHashes.CopySha1To(destination.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize));
         }
 
-        if (rawHashes.Blake3 != null)
+        if (rawHashes.HasBlake3)
         {
-            rawHashes.Blake3.CopyTo(destination.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize));
+            rawHashes.CopyBlake3To(destination.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize));
         }
 
         BinaryPrimitives.WriteUInt64LittleEndian(destination[HeaderChecksumOffset..], ComputeHeaderChecksum(destination));
@@ -209,40 +209,33 @@ internal static class AscfFileHeaderCodec
             return false;
         }
 
-        byte[]? sha1 = null;
+        rawHashes = AscfRawHashBytes.Empty;
         if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Sha1))
         {
-            sha1 = source.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize).ToArray();
+            rawHashes = rawHashes.WithSha1(source.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize));
         }
         else if (!ReservedBytesAreZero(source.Slice(Sha1HashOffset, AscfFileFormat.Sha1HashSize)))
         {
             return false;
         }
 
-        byte[]? blake3 = null;
         if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Blake3))
         {
-            blake3 = source.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize).ToArray();
+            rawHashes = rawHashes.WithBlake3(source.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize));
         }
         else if (!ReservedBytesAreZero(source.Slice(Blake3HashOffset, AscfFileFormat.Blake3HashSize)))
         {
             return false;
         }
 
-        rawHashes = new AscfRawHashBytes(sha1, blake3);
         return true;
     }
 
-    private static void ValidateRawHashLengths(AscfRawHashBytes rawHashes)
+    private static void ValidateRawHashAlgorithms(AscfRawHashBytes rawHashes)
     {
-        if (rawHashes.Sha1 is { Length: not AscfFileFormat.Sha1HashSize })
+        if (!AscfRawHashAlgorithmFlags.IsSupported(rawHashes.Algorithms))
         {
-            throw new ArgumentException("SHA-1 hash length is invalid.", nameof(rawHashes));
-        }
-
-        if (rawHashes.Blake3 is { Length: not AscfFileFormat.Blake3HashSize })
-        {
-            throw new ArgumentException("BLAKE3 hash length is invalid.", nameof(rawHashes));
+            throw new ArgumentException("Raw hash algorithms are invalid.", nameof(rawHashes));
         }
     }
 

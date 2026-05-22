@@ -35,15 +35,26 @@ internal sealed class AscfRawContentHasher : IDisposable
 
     public AscfRawHashBytes FinalizeHashes()
     {
-        var sha1 = _sha1?.GetHashAndReset();
-        byte[]? blake3 = null;
-        if (_hasBlake3)
+        var hashes = AscfRawHashBytes.Empty;
+        if (_sha1 != null)
         {
-            blake3 = new byte[AscfFileFormat.Blake3HashSize];
-            _blake3.Finalize(blake3);
+            Span<byte> sha1 = stackalloc byte[AscfFileFormat.Sha1HashSize];
+            if (!_sha1.TryGetHashAndReset(sha1, out var bytesWritten) || bytesWritten != AscfFileFormat.Sha1HashSize)
+            {
+                throw new InvalidOperationException("SHA-1 hash finalization failed.");
+            }
+
+            hashes = hashes.WithSha1(sha1);
         }
 
-        return new AscfRawHashBytes(sha1, blake3);
+        if (_hasBlake3)
+        {
+            Span<byte> blake3 = stackalloc byte[AscfFileFormat.Blake3HashSize];
+            _blake3.Finalize(blake3);
+            hashes = hashes.WithBlake3(blake3);
+        }
+
+        return hashes;
     }
 
     public void Dispose()

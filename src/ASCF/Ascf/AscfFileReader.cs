@@ -3,7 +3,6 @@ using ASCF.Util;
 using Microsoft.Win32.SafeHandles;
 using System.Buffers;
 using System.IO.Hashing;
-using System.Security.Cryptography;
 
 namespace ASCF;
 
@@ -1004,15 +1003,18 @@ public static class AscfFileReader
 
     private static void ValidateStoredHashes(AscfFileHeader fileHeader, AscfRawHashBytes computed)
     {
-        ValidateStoredHash(fileHeader.RawHashes.Sha1, computed.Sha1, AscfRawHashAlgorithms.Sha1);
-        ValidateStoredHash(fileHeader.RawHashes.Blake3, computed.Blake3, AscfRawHashAlgorithms.Blake3);
+        ValidateStoredHash(fileHeader.RawHashes, computed, AscfRawHashAlgorithms.Sha1);
+        ValidateStoredHash(fileHeader.RawHashes, computed, AscfRawHashAlgorithms.Blake3);
     }
 
-    private static void ValidateStoredHash(byte[]? stored, byte[]? computed, AscfRawHashAlgorithms algorithm)
+    private static void ValidateStoredHash(AscfRawHashBytes stored, AscfRawHashBytes computed, AscfRawHashAlgorithms algorithm)
     {
-        if (stored != null
-            && computed != null
-            && !CryptographicOperations.FixedTimeEquals(stored, computed))
+        if (!stored.HasHash(algorithm))
+        {
+            return;
+        }
+
+        if (!computed.HashEquals(algorithm, stored))
         {
             throw new InvalidDataException($".ascf raw {AscfRawHashAlgorithmFlags.GetDisplayName(algorithm)} hash does not match decoded content.");
         }
