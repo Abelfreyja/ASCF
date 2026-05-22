@@ -8,8 +8,6 @@ namespace ASCF;
 
 public static class AscfFileWriter
 {
-    private const int IndexEntriesPerPage = 1024;
-
     [StructLayout(LayoutKind.Auto)]
     public readonly record struct WriteResult(long RawSize, long StoredSize);
 
@@ -1012,7 +1010,7 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
-        var pageSize = checked(AscfFileFormat.IndexEntrySize * IndexEntriesPerPage);
+        var pageSize = checked(AscfFileFormat.IndexEntrySize * FileFormatBuffers.IndexEntriesPerPage);
         var page = ArrayPool<byte>.Shared.Rent(pageSize);
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
         try

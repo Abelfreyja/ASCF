@@ -2,6 +2,7 @@ using ASCF.Lz4;
 using ASCF.Util;
 using Microsoft.Win32.SafeHandles;
 using System.Buffers;
+using System.IO.Hashing;
 using System.Security.Cryptography;
 
 namespace ASCF;
@@ -1024,13 +1025,38 @@ public static class AscfFileReader
         long indexOffset)
     {
         var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
-        Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
-        for (var i = 0; i < entries.Count; i++)
+        if (entries.Count <= FileFormatBuffers.IndexDirectReadThreshold)
         {
-            input.ReadExactly(entryBytes);
-            indexChecksum.Append(entryBytes);
-            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
+            Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
+            for (var i = 0; i < entries.Count; i++)
+            {
+                input.ReadExactly(entryBytes);
+                indexChecksum.Append(entryBytes);
+                ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
+            }
+        }
+        else
+        {
+            var pageSize = GetIndexPageByteCount(FileFormatBuffers.IndexEntriesPerPage);
+            var page = ArrayPool<byte>.Shared.Rent(pageSize);
+            try
+            {
+                var entryIndex = 0;
+                while (entryIndex < entries.Count)
+                {
+                    var entriesThisPage = Math.Min(FileFormatBuffers.IndexEntriesPerPage, entries.Count - entryIndex);
+                    var bytesThisPage = GetIndexPageByteCount(entriesThisPage);
+                    input.ReadExactly(page.AsSpan(0, bytesThisPage));
+                    ValidateIndexEntriesPage(page.AsSpan(0, bytesThisPage), entriesThisPage, entries, entryIndex, indexChecksum);
+
+                    entryIndex += entriesThisPage;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(page);
+            }
         }
 
         var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
@@ -1078,18 +1104,32 @@ public static class AscfFileReader
         }
 
         var indexLength = checked((long)entries.Count * AscfFileFormat.IndexEntrySize);
-        var entryBytes = new byte[AscfFileFormat.IndexEntrySize];
+        var pageSize = GetIndexPageByteCount(FileFormatBuffers.IndexEntriesPerPage);
+        var page = ArrayPool<byte>.Shared.Rent(pageSize);
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
-        for (var i = 0; i < entries.Count; i++)
+        try
         {
-            await ReadTransformedBytesAsync(input, entryBytes.AsMemory(0, entryBytes.Length), transform, token).ConfigureAwait(false);
-            indexChecksum.Append(entryBytes);
-            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), entries[i]);
-
-            if (writeWirePayload)
+            var entryIndex = 0;
+            while (entryIndex < entries.Count)
             {
-                await output!.WriteAsync(entryBytes.AsMemory(0, entryBytes.Length), token).ConfigureAwait(false);
+                var entriesThisPage = Math.Min(FileFormatBuffers.IndexEntriesPerPage, entries.Count - entryIndex);
+                var bytesThisPage = GetIndexPageByteCount(entriesThisPage);
+                await input.ReadExactlyAsync(page.AsMemory(0, bytesThisPage), token).ConfigureAwait(false);
+
+                TransformIndexEntriesPage(page.AsSpan(0, bytesThisPage), entriesThisPage, transform);
+                ValidateIndexEntriesPage(page.AsSpan(0, bytesThisPage), entriesThisPage, entries, entryIndex, indexChecksum);
+
+                if (writeWirePayload)
+                {
+                    await output!.WriteAsync(page.AsMemory(0, bytesThisPage), token).ConfigureAwait(false);
+                }
+
+                entryIndex += entriesThisPage;
             }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(page);
         }
 
         var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
@@ -1146,13 +1186,38 @@ public static class AscfFileReader
     private static AscfChunkIndex ReadChunkIndexEntries(Stream input, AscfIndexFooter footer)
     {
         var entries = new AscfChunkIndexEntry[footer.ChunkCount];
-        Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
-        for (var i = 0; i < entries.Length; i++)
+        if (entries.Length <= FileFormatBuffers.IndexDirectReadThreshold)
         {
-            input.ReadExactly(entryBytes);
-            indexChecksum.Append(entryBytes);
-            entries[i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+            Span<byte> entryBytes = stackalloc byte[AscfFileFormat.IndexEntrySize];
+            for (var i = 0; i < entries.Length; i++)
+            {
+                input.ReadExactly(entryBytes);
+                indexChecksum.Append(entryBytes);
+                entries[i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+            }
+        }
+        else
+        {
+            var pageSize = GetIndexPageByteCount(FileFormatBuffers.IndexEntriesPerPage);
+            var page = ArrayPool<byte>.Shared.Rent(pageSize);
+            try
+            {
+                var entryIndex = 0;
+                while (entryIndex < entries.Length)
+                {
+                    var entriesThisPage = Math.Min(FileFormatBuffers.IndexEntriesPerPage, entries.Length - entryIndex);
+                    var bytesThisPage = GetIndexPageByteCount(entriesThisPage);
+                    input.ReadExactly(page.AsSpan(0, bytesThisPage));
+                    ReadIndexEntriesPage(page.AsSpan(0, bytesThisPage), entriesThisPage, entries, entryIndex, indexChecksum);
+
+                    entryIndex += entriesThisPage;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(page);
+            }
         }
 
         ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
@@ -1162,13 +1227,25 @@ public static class AscfFileReader
     private static async Task<AscfChunkIndex> ReadChunkIndexEntriesAsync(FileStream input, AscfIndexFooter footer, CancellationToken token)
     {
         var entries = new AscfChunkIndexEntry[footer.ChunkCount];
-        var entryBytes = new byte[AscfFileFormat.IndexEntrySize];
+        var pageSize = GetIndexPageByteCount(FileFormatBuffers.IndexEntriesPerPage);
+        var page = ArrayPool<byte>.Shared.Rent(pageSize);
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
-        for (var i = 0; i < entries.Length; i++)
+        try
         {
-            await input.ReadExactlyAsync(entryBytes.AsMemory(0, entryBytes.Length), token).ConfigureAwait(false);
-            indexChecksum.Append(entryBytes);
-            entries[i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+            var entryIndex = 0;
+            while (entryIndex < entries.Length)
+            {
+                var entriesThisPage = Math.Min(FileFormatBuffers.IndexEntriesPerPage, entries.Length - entryIndex);
+                var bytesThisPage = GetIndexPageByteCount(entriesThisPage);
+                await input.ReadExactlyAsync(page.AsMemory(0, bytesThisPage), token).ConfigureAwait(false);
+                ReadIndexEntriesPage(page.AsSpan(0, bytesThisPage), entriesThisPage, entries, entryIndex, indexChecksum);
+
+                entryIndex += entriesThisPage;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(page);
         }
 
         ValidateIndexChecksum(footer, indexChecksum.GetCurrentHashAsUInt64());
@@ -1452,6 +1529,58 @@ public static class AscfFileReader
             throw new InvalidDataException(".ascf index checksum mismatch.");
         }
     }
+
+    private static void ValidateIndexEntriesPage(
+        ReadOnlySpan<byte> page,
+        int entryCount,
+        List<AscfChunkIndexEntry> expectedEntries,
+        int entryOffset,
+        XxHash3 indexChecksum)
+    {
+        for (var i = 0; i < entryCount; i++)
+        {
+            var entryBytes = GetIndexEntryBytes(page, i);
+            indexChecksum.Append(entryBytes);
+            ValidateIndexEntry(AscfChunkIndexCodec.ReadEntry(entryBytes), expectedEntries[entryOffset + i]);
+        }
+    }
+
+    private static void ReadIndexEntriesPage(
+        ReadOnlySpan<byte> page,
+        int entryCount,
+        AscfChunkIndexEntry[] entries,
+        int entryOffset,
+        XxHash3 indexChecksum)
+    {
+        for (var i = 0; i < entryCount; i++)
+        {
+            var entryBytes = GetIndexEntryBytes(page, i);
+            indexChecksum.Append(entryBytes);
+            entries[entryOffset + i] = AscfChunkIndexCodec.ReadEntry(entryBytes);
+        }
+    }
+
+    private static void TransformIndexEntriesPage(Span<byte> page, int entryCount, AscfBufferTransform? transform)
+    {
+        if (transform == null)
+        {
+            return;
+        }
+
+        for (var i = 0; i < entryCount; i++)
+        {
+            transform(GetIndexEntryBytes(page, i));
+        }
+    }
+
+    private static ReadOnlySpan<byte> GetIndexEntryBytes(ReadOnlySpan<byte> page, int entryIndex)
+        => page.Slice(checked(entryIndex * AscfFileFormat.IndexEntrySize), AscfFileFormat.IndexEntrySize);
+
+    private static Span<byte> GetIndexEntryBytes(Span<byte> page, int entryIndex)
+        => page.Slice(checked(entryIndex * AscfFileFormat.IndexEntrySize), AscfFileFormat.IndexEntrySize);
+
+    private static int GetIndexPageByteCount(int entryCount)
+        => checked(entryCount * AscfFileFormat.IndexEntrySize);
 
     private static async Task<AscfRawHashBytes> ComputeHashesAsync(Stream input, AscfRawHashAlgorithms algorithms, int bufferSize, CancellationToken token)
     {
