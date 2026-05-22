@@ -160,15 +160,10 @@ public sealed class AscfChunkIndex
             throw new InvalidDataException($".ascf index entry uses unsupported method {entry.Method}.");
         }
 
-        var maxStoredLength = Lz4BlockCodec.MaxCompressedLength(entry.RawLength);
+        var maxStoredLength = Lz4BlockCodec.MaxUsefulCompressedLength(entry.RawLength);
         if (entry.StoredLength <= 0 || entry.StoredLength > maxStoredLength)
         {
             throw new InvalidDataException($".ascf compressed index entry length {entry.StoredLength} is invalid.");
-        }
-
-        if (entry.StoredLength >= entry.RawLength)
-        {
-            throw new InvalidDataException(".ascf compressed index entry should have been stored raw.");
         }
     }
 

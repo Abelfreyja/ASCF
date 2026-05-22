@@ -16,6 +16,9 @@ internal static unsafe class Lz4BlockCodec
     public static int MaxCompressedLength(int rawLength)
         => LZ4Codec.MaximumOutputSize(rawLength);
 
+    public static int MaxUsefulCompressedLength(int rawLength)
+        => rawLength <= 13 ? 0 : rawLength - 1;
+
     public static EncodedBlock Encode(ReadOnlySpan<byte> raw, Span<byte> compressedDestination)
     {
         var encodedLength = LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L09_HC);

@@ -188,15 +188,10 @@ internal static class AscfChunkHeaderCodec
             return;
         }
 
-        var maxStoredLength = Lz4BlockCodec.MaxCompressedLength(rawLength);
+        var maxStoredLength = Lz4BlockCodec.MaxUsefulCompressedLength(rawLength);
         if (storedLength <= 0 || storedLength > maxStoredLength)
         {
             throw new InvalidDataException($"Invalid .ascf compressed chunk length {storedLength}.");
-        }
-
-        if (storedLength >= rawLength)
-        {
-            throw new InvalidDataException(".ascf compressed chunk should have been stored raw.");
         }
     }
 

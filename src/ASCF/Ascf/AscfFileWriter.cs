@@ -441,7 +441,7 @@ public static class AscfFileWriter
             };
         }
 
-        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(options.Format.RawChunkSize);
+        var maxUsefulCompressedLength = Lz4BlockCodec.MaxUsefulCompressedLength(options.Format.RawChunkSize);
         var pipelineChunkLimit = options.Format.GetCompressionPipelineChunkLimit();
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var entries = knownChunkCount.HasValue
@@ -465,7 +465,7 @@ public static class AscfFileWriter
         using var pipelineCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         var pipelineToken = pipelineCancellation.Token;
         var producerTask = ReadRawChunksForCompressionAsync(source, rawChunks.Writer, pipelineSlots, hasher, options, pipelineToken);
-        var workerTasks = StartCompressionWorkers(rawChunks.Reader, encodedChunks.Writer, pipelineSlots, workerCount, maxCompressedSize, pipelineToken);
+        var workerTasks = StartCompressionWorkers(rawChunks.Reader, encodedChunks.Writer, pipelineSlots, workerCount, maxUsefulCompressedLength, pipelineToken);
         var completionTask = CompleteEncodedChunksWhenWorkersFinishAsync(rawChunks.Writer, encodedChunks.Writer, workerTasks);
         try
         {
@@ -506,7 +506,7 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
-        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(options.Format.RawChunkSize);
+        var maxUsefulCompressedLength = Lz4BlockCodec.MaxUsefulCompressedLength(options.Format.RawChunkSize);
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var entries = knownChunkCount.HasValue
             ? new List<AscfChunkIndexEntry>(knownChunkCount.Value)
@@ -519,7 +519,7 @@ public static class AscfFileWriter
             long encodedOffset = AscfFileFormat.HeaderSize;
             while (true)
             {
-                var nextChunk = await ReadCompressedChunkInlineAsync(source, hasher, rawSize, maxCompressedSize, options, token).ConfigureAwait(false);
+                var nextChunk = await ReadCompressedChunkInlineAsync(source, hasher, rawSize, maxUsefulCompressedLength, options, token).ConfigureAwait(false);
                 if (nextChunk == null)
                 {
                     break;
@@ -564,7 +564,7 @@ public static class AscfFileWriter
         Stream source,
         AscfRawContentHasher? hasher,
         long currentRawSize,
-        int maxCompressedSize,
+        int maxUsefulCompressedLength,
         WriteOptions options,
         CancellationToken token)
     {
@@ -575,7 +575,7 @@ public static class AscfFileWriter
             return null;
         }
 
-        return AscfChunkCompressor.Encode(rawChunk.TakeBuffer(), rawChunk.RawLength, maxCompressedSize);
+        return AscfChunkCompressor.Encode(rawChunk.TakeBuffer(), rawChunk.RawLength, maxUsefulCompressedLength);
     }
 
     private static async Task<CompressedReadResult> ReadRawChunksForCompressionAsync(
@@ -672,14 +672,14 @@ public static class AscfFileWriter
         ChannelWriter<EncodedChunkResult> encodedChunks,
         SemaphoreSlim pipelineSlots,
         int workerCount,
-        int maxCompressedSize,
+        int maxUsefulCompressedLength,
         CancellationToken token)
     {
         var workers = new Task[workerCount];
         for (var i = 0; i < workers.Length; i++)
         {
             workers[i] = Task.Run(
-                () => RunCompressionWorkerAsync(rawChunks, encodedChunks, pipelineSlots, maxCompressedSize, token),
+                () => RunCompressionWorkerAsync(rawChunks, encodedChunks, pipelineSlots, maxUsefulCompressedLength, token),
                 CancellationToken.None);
         }
 
@@ -690,7 +690,7 @@ public static class AscfFileWriter
         ChannelReader<RawChunk> rawChunks,
         ChannelWriter<EncodedChunkResult> encodedChunks,
         SemaphoreSlim pipelineSlots,
-        int maxCompressedSize,
+        int maxUsefulCompressedLength,
         CancellationToken token)
     {
         await foreach (var rawChunk in rawChunks.ReadAllAsync(token).ConfigureAwait(false))
@@ -699,7 +699,7 @@ public static class AscfFileWriter
             var delivered = false;
             try
             {
-                encodedChunk = AscfChunkCompressor.Encode(rawChunk.TakeBuffer(), rawChunk.RawLength, maxCompressedSize);
+                encodedChunk = AscfChunkCompressor.Encode(rawChunk.TakeBuffer(), rawChunk.RawLength, maxUsefulCompressedLength);
                 await encodedChunks.WriteAsync(new EncodedChunkResult(rawChunk.ChunkIndex, encodedChunk), token).ConfigureAwait(false);
                 delivered = true;
                 encodedChunk = null;

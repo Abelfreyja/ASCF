@@ -37,7 +37,7 @@ public sealed record AscfWriterOptions
             return 1;
         }
 
-        var bytesPerChunk = checked((long)RawChunkSize + Lz4BlockCodec.MaxCompressedLength(RawChunkSize));
+        var bytesPerChunk = checked((long)RawChunkSize + Lz4BlockCodec.MaxUsefulCompressedLength(RawChunkSize));
         return FileFormatWorkerCounts.ResolveByteWindow(
             bytesPerChunk,
             MaxCompressionPipelineBytes,

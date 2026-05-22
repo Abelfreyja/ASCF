@@ -221,8 +221,8 @@ public static class AscfFileReader
         using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
 
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
+        var maxStoredPayloadSize = fileHeader.RawChunkSize;
+        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
         var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
         var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
         try
@@ -310,8 +310,8 @@ public static class AscfFileReader
             await output.WriteAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
 
             var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-            var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-            var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
+            var maxStoredPayloadSize = fileHeader.RawChunkSize;
+            var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
             var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
             try
             {
@@ -792,8 +792,8 @@ public static class AscfFileReader
             using var hasher = computeHash ? CreateRawHasher(GetHashAlgorithms(fileHeader, options)) : null;
 
             var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-            var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-            var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
+            var maxStoredPayloadSize = fileHeader.RawChunkSize;
+            var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
             var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
             try
             {
@@ -1321,8 +1321,8 @@ public static class AscfFileReader
         CancellationToken token)
     {
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-        var maxCompressedSize = Lz4BlockCodec.MaxCompressedLength(fileHeader.RawChunkSize);
-        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
+        var maxStoredPayloadSize = fileHeader.RawChunkSize;
+        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
         var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
         var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
         try

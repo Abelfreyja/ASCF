@@ -6,44 +6,49 @@ namespace ASCF;
 
 internal static class AscfChunkCompressor
 {
-    public static EncodedChunk Encode(byte[] rawBuffer, int rawLength, int maxCompressedSize)
+    public static EncodedChunk Encode(byte[] rawBuffer, int rawLength, int maxUsefulCompressedLength)
     {
         byte[]? rawBufferOwner = rawBuffer;
-        byte[]? compressedBuffer = ArrayPool<byte>.Shared.Rent(maxCompressedSize);
+        byte[]? compressedBuffer = maxUsefulCompressedLength == 0
+            ? null
+            : ArrayPool<byte>.Shared.Rent(maxUsefulCompressedLength);
         try
         {
             var raw = rawBufferOwner!.AsSpan(0, rawLength);
             var rawChecksum = AscfChecksum.ComputeXxHash3(raw);
-            var encoded = Lz4BlockCodec.EncodeWithFastCheck(raw, compressedBuffer.AsSpan(0, maxCompressedSize));
-            if (encoded.StoresRaw)
+            if (compressedBuffer != null)
             {
+                var encoded = Lz4BlockCodec.EncodeWithFastCheck(raw, compressedBuffer.AsSpan(0, maxUsefulCompressedLength));
+                if (!encoded.StoresRaw)
+                {
+                    var storedChecksum = AscfChecksum.ComputeXxHash3(compressedBuffer.AsSpan(0, encoded.StoredLength));
+                    ArrayPool<byte>.Shared.Return(rawBufferOwner);
+                    rawBufferOwner = null;
+
+                    var storedPayload = new PooledBufferOwner(compressedBuffer, encoded.StoredLength);
+                    compressedBuffer = null;
+                    return new EncodedChunk(
+                        rawLength,
+                        encoded.StoredLength,
+                        AscfFileFormat.MethodLz4HighCompression,
+                        rawChecksum,
+                        storedChecksum,
+                        storedPayload);
+                }
+
                 ArrayPool<byte>.Shared.Return(compressedBuffer);
                 compressedBuffer = null;
-
-                var payload = new PooledBufferOwner(rawBufferOwner, rawLength);
-                rawBufferOwner = null;
-                return new EncodedChunk(
-                    rawLength,
-                    rawLength,
-                    AscfFileFormat.MethodRaw,
-                    rawChecksum,
-                    rawChecksum,
-                    payload);
             }
 
-            var storedChecksum = AscfChecksum.ComputeXxHash3(compressedBuffer.AsSpan(0, encoded.StoredLength));
-            ArrayPool<byte>.Shared.Return(rawBufferOwner);
+            var payload = new PooledBufferOwner(rawBufferOwner, rawLength);
             rawBufferOwner = null;
-
-            var storedPayload = new PooledBufferOwner(compressedBuffer, encoded.StoredLength);
-            compressedBuffer = null;
             return new EncodedChunk(
                 rawLength,
-                encoded.StoredLength,
-                AscfFileFormat.MethodLz4HighCompression,
+                rawLength,
+                AscfFileFormat.MethodRaw,
                 rawChecksum,
-                storedChecksum,
-                storedPayload);
+                rawChecksum,
+                payload);
         }
         finally
         {
