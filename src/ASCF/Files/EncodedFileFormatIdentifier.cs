@@ -1,5 +1,6 @@
 using ASCF.Lz4;
 using ASCF.Util;
+using System.Buffers;
 
 namespace ASCF.Files;
 
@@ -70,13 +71,75 @@ public static class EncodedFileFormatIdentifier
             return EncodedFileFormat.Unknown;
         }
 
-        if (read >= AscfFileFormat.HeaderSize
+        return IdentifyHeader(header[..read], length, options);
+    }
+
+    public static Task<EncodedFileFormat> IdentifyAsync(
+        Stream stream,
+        long length,
+        CancellationToken token)
+        => IdentifyAsync(stream, length, transform: null, EncodedFileFormatIdentificationOptions.Default, token);
+
+    public static Task<EncodedFileFormat> IdentifyAsync(
+        Stream stream,
+        long length,
+        AscfBufferTransform? transform,
+        EncodedFileFormatIdentificationOptions options,
+        CancellationToken token)
+    {
+        if (!stream.CanSeek)
+        {
+            throw new InvalidOperationException("Encoded stream must be seekable.");
+        }
+
+        return IdentifySeekableStreamAsync(stream, length, transform, options, token);
+    }
+
+    private static async Task<EncodedFileFormat> IdentifySeekableStreamAsync(
+        Stream stream,
+        long length,
+        AscfBufferTransform? transform,
+        EncodedFileFormatIdentificationOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        if (length <= 0)
+        {
+            return EncodedFileFormat.Unknown;
+        }
+
+        var startPosition = stream.Position;
+        var headerLength = checked((int)Math.Min(HeaderBufferSize, length));
+        var header = ArrayPool<byte>.Shared.Rent(headerLength);
+        try
+        {
+            await stream.ReadExactlyAsync(header.AsMemory(0, headerLength), token).ConfigureAwait(false);
+            transform?.Invoke(header.AsSpan(0, headerLength));
+            return IdentifyHeader(header.AsSpan(0, headerLength), length, options);
+        }
+        catch (EndOfStreamException)
+        {
+            return EncodedFileFormat.Unknown;
+        }
+        finally
+        {
+            stream.Position = startPosition;
+            ArrayPool<byte>.Shared.Return(header);
+        }
+    }
+
+    private static EncodedFileFormat IdentifyHeader(
+        ReadOnlySpan<byte> header,
+        long length,
+        EncodedFileFormatIdentificationOptions options)
+    {
+        if (header.Length >= AscfFileFormat.HeaderSize
             && AscfFileReader.LooksLikeAscf(header[..AscfFileFormat.HeaderSize], options.AscfReader))
         {
             return EncodedFileFormat.Ascf;
         }
 
-        if (read >= WrappedLz4FileFormat.HeaderSize
+        if (header.Length >= WrappedLz4FileFormat.HeaderSize
             && WrappedLz4FileFormat.TryReadHeader(length, header[..WrappedLz4FileFormat.HeaderSize], options.Lz4).HasValue)
         {
             return EncodedFileFormat.WrappedLz4;

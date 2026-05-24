@@ -11,9 +11,6 @@ internal static unsafe class Lz4BlockCodec
         public bool StoresRaw => StoredLength == RawLength;
     }
 
-    public static int MaxCompressedLength(int rawLength)
-        => LZ4Codec.MaximumOutputSize(rawLength);
-
     public static int MaxUsefulCompressedLength(int rawLength)
         => rawLength <= 13 ? 0 : rawLength - 1;
 
@@ -58,6 +55,13 @@ internal static unsafe class Lz4BlockCodec
     public static int Decode(ReadOnlySpan<byte> stored, Span<byte> raw, int expectedRawLength)
     {
         var decodedLength = LZ4Codec.Decode(stored, raw[..expectedRawLength]);
+        ValidateDecodedLength(decodedLength, expectedRawLength);
+        return decodedLength;
+    }
+
+    public static int Decode(byte[] stored, int storedOffset, int storedLength, byte[] raw, int rawOffset, int expectedRawLength)
+    {
+        var decodedLength = LZ4Codec.Decode(stored, storedOffset, storedLength, raw, rawOffset, expectedRawLength);
         ValidateDecodedLength(decodedLength, expectedRawLength);
         return decodedLength;
     }

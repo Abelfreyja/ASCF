@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Security.Cryptography;
 
 namespace ASCF.Util;
 
@@ -7,7 +6,7 @@ internal static class FileFormatHashing
 {
     public static async Task AppendExactlyAsync(
         Stream input,
-        IncrementalHash hasher,
+        AscfRawContentHasher? hasher,
         int byteCount,
         int bufferSize,
         CancellationToken token)
@@ -26,7 +25,7 @@ internal static class FileFormatHashing
                     throw new EndOfStreamException();
                 }
 
-                hasher.AppendData(buffer.AsSpan(0, read));
+                hasher?.AppendData(buffer.AsSpan(0, read));
                 remaining -= read;
             }
         }
@@ -38,7 +37,7 @@ internal static class FileFormatHashing
 
     public static void AppendExactly(
         Stream input,
-        IncrementalHash hasher,
+        AscfRawContentHasher? hasher,
         int byteCount,
         int bufferSize)
     {
@@ -56,7 +55,7 @@ internal static class FileFormatHashing
                     throw new EndOfStreamException();
                 }
 
-                hasher.AppendData(buffer.AsSpan(0, read));
+                hasher?.AppendData(buffer.AsSpan(0, read));
                 remaining -= read;
             }
         }

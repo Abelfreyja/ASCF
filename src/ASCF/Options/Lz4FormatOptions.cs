@@ -12,6 +12,7 @@ public sealed record Lz4FormatOptions
     public int BufferSize { get; init; } = AscfFileFormat.DefaultBufferSize;
     public int CopyBufferSize { get; init; } = AscfFileFormat.DefaultBufferSize;
     public int MemoryMappedCompressionThreshold { get; init; } = 8 * 1024 * 1024;
+    public int MemoryMappedDecodeThreshold { get; init; } = 128 * 1024 * 1024;
 
     internal void Validate()
     {
@@ -34,6 +35,14 @@ public sealed record Lz4FormatOptions
                 nameof(MemoryMappedCompressionThreshold),
                 MemoryMappedCompressionThreshold,
                 "Memory mapped compression threshold must be non-negative.");
+        }
+
+        if (MemoryMappedDecodeThreshold < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MemoryMappedDecodeThreshold),
+                MemoryMappedDecodeThreshold,
+                "Memory mapped decode threshold must be non-negative.");
         }
     }
 }

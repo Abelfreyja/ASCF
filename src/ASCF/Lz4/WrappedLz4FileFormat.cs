@@ -2,7 +2,6 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using ASCF.Util;
 
 namespace ASCF.Lz4;
@@ -15,6 +14,9 @@ public static class WrappedLz4FileFormat
     public readonly record struct WriteResult(long OriginalSize, long CompressedSize);
 
     [StructLayout(LayoutKind.Auto)]
+    public readonly record struct HashedWriteResult(AscfRawHashes Hashes, long OriginalSize, long CompressedSize);
+
+    [StructLayout(LayoutKind.Auto)]
     public readonly record struct Header(int OutputLength, int InputLength);
 
     public static Task<WriteResult> WriteFromRawFileAsync(string sourcePath, string outputPath, CancellationToken token)
@@ -22,7 +24,40 @@ public static class WrappedLz4FileFormat
 
     public static async Task<WriteResult> WriteFromRawFileAsync(string sourcePath, string outputPath, Lz4FormatOptions options, CancellationToken token)
     {
+        var result = await WriteFromRawFileInternalAsync(
+            sourcePath,
+            outputPath,
+            AscfRawHashAlgorithms.None,
+            options,
+            token).ConfigureAwait(false);
+
+        return new WriteResult(result.OriginalSize, result.CompressedSize);
+    }
+
+    public static Task<HashedWriteResult> WriteFromRawFileWithHashAsync(
+        string sourcePath,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        CancellationToken token)
+        => WriteFromRawFileWithHashAsync(sourcePath, outputPath, algorithms, Lz4FormatOptions.Default, token);
+
+    public static Task<HashedWriteResult> WriteFromRawFileWithHashAsync(
+        string sourcePath,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options,
+        CancellationToken token)
+        => WriteFromRawFileInternalAsync(sourcePath, outputPath, algorithms, options, token);
+
+    private static async Task<HashedWriteResult> WriteFromRawFileInternalAsync(
+        string sourcePath,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
         options.Validate();
+        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
         var sourceInfo = new FileInfo(sourcePath);
         if (!sourceInfo.Exists)
         {
@@ -42,8 +77,8 @@ public static class WrappedLz4FileFormat
         FileFormatPaths.EnsureOutputDirectory(outputPath);
 
         return sourceInfo.Length == 0 || sourceInfo.Length < options.MemoryMappedCompressionThreshold
-            ? await WriteSmallFileAsync(sourcePath, outputPath, options, token).ConfigureAwait(false)
-            : WriteMemoryMappedFile(sourcePath, outputPath, options, token);
+            ? await WriteSmallFileAsync(sourcePath, outputPath, algorithms, options, token).ConfigureAwait(false)
+            : WriteMemoryMappedFile(sourcePath, outputPath, algorithms, options, token);
     }
 
     public static Task<long> ExtractToRawFileAsync(string wrappedPath, string outputPath, CancellationToken token)
@@ -62,20 +97,23 @@ public static class WrappedLz4FileFormat
             var inputLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
             ValidateHeader(input.Length, outputLength, inputLength, options.MaxRawFileBytes);
 
-            FileFormatPaths.EnsureOutputDirectory(outputPath);
+            using var staged = FileFormatPaths.CreateStagedFile(outputPath);
             if (outputLength == 0)
             {
-                await CreateEmptyFileAsync(outputPath, token).ConfigureAwait(false);
+                await CreateEmptyFileAsync(staged, options, token).ConfigureAwait(false);
+                staged.Commit();
                 return 0;
             }
 
             if (inputLength == outputLength)
             {
-                await CopyStoredRawPayloadAsync(input, outputPath, inputLength, options, token).ConfigureAwait(false);
+                await CopyStoredRawPayloadAsync(input, staged, inputLength, options, token).ConfigureAwait(false);
+                staged.Commit();
                 return outputLength;
             }
 
-            await DecodeCompressedPayloadToRawFileAsync(wrappedPath, outputPath, inputLength, outputLength, token).ConfigureAwait(false);
+            await DecodeCompressedPayloadToRawFileAsync(input, wrappedPath, staged, inputLength, outputLength, options, token).ConfigureAwait(false);
+            staged.Commit();
             return outputLength;
         }
     }
@@ -226,32 +264,59 @@ public static class WrappedLz4FileFormat
         int copyBufferSize,
         CancellationToken token)
     {
+        var result = await ComputeRawHashesAsync(
+            wrappedPath,
+            header,
+            AscfRawHashAlgorithms.Sha1,
+            streamBufferSize,
+            copyBufferSize,
+            token).ConfigureAwait(false);
+
+        return ToSha1HashResult(result);
+    }
+
+    public static async Task<FileFormatRawHashResult> ComputeRawHashesAsync(
+        string wrappedPath,
+        Header header,
+        AscfRawHashAlgorithms algorithms,
+        int streamBufferSize,
+        int copyBufferSize,
+        CancellationToken token)
+    {
         FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
+        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
 
         var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
         await using (input.ConfigureAwait(false))
         {
             input.Position = HeaderSize;
-            using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+            using var hasher = AscfRawContentHasher.Create(algorithms);
             if (header.OutputLength == 0)
             {
-                return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), 0);
+                return ToRawHashResult(hasher, 0);
             }
 
             if (Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength))
             {
                 await FileFormatHashing.AppendExactlyAsync(input, hasher, header.InputLength, copyBufferSize, token).ConfigureAwait(false);
-                return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
+                return ToRawHashResult(hasher, header.OutputLength);
             }
 
-            var compressed = new byte[header.InputLength];
-            await input.ReadExactlyAsync(compressed.AsMemory(0, compressed.Length), token).ConfigureAwait(false);
-            var raw = new byte[header.OutputLength];
-            Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw, header.OutputLength);
-
-            hasher.AppendData(raw);
-            return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
+            var compressed = ArrayPool<byte>.Shared.Rent(header.InputLength);
+            var raw = ArrayPool<byte>.Shared.Rent(header.OutputLength);
+            try
+            {
+                await input.ReadExactlyAsync(compressed.AsMemory(0, header.InputLength), token).ConfigureAwait(false);
+                Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw.AsSpan(0, header.OutputLength), header.OutputLength);
+                hasher?.AppendData(raw.AsSpan(0, header.OutputLength));
+                return ToRawHashResult(hasher, header.OutputLength);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(raw);
+                ArrayPool<byte>.Shared.Return(compressed);
+            }
         }
     }
 
@@ -261,57 +326,163 @@ public static class WrappedLz4FileFormat
         int streamBufferSize,
         int copyBufferSize)
     {
+        var result = ComputeRawHashes(wrappedPath, header, AscfRawHashAlgorithms.Sha1, streamBufferSize, copyBufferSize);
+        return ToSha1HashResult(result);
+    }
+
+    public static FileFormatRawHashResult ComputeRawHashes(
+        string wrappedPath,
+        Header header,
+        AscfRawHashAlgorithms algorithms,
+        int streamBufferSize,
+        int copyBufferSize)
+    {
         FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
+        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
 
         using var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, FileOptions.SequentialScan);
         input.Position = HeaderSize;
 
-        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+        using var hasher = AscfRawContentHasher.Create(algorithms);
         if (header.OutputLength == 0)
         {
-            return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), 0);
+            return ToRawHashResult(hasher, 0);
         }
 
         if (Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength))
         {
             FileFormatHashing.AppendExactly(input, hasher, header.InputLength, copyBufferSize);
-            return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
+            return ToRawHashResult(hasher, header.OutputLength);
         }
 
-        var compressed = new byte[header.InputLength];
-        input.ReadExactly(compressed);
-        var raw = new byte[header.OutputLength];
-        Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw, header.OutputLength);
-
-        hasher.AppendData(raw);
-        return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), header.OutputLength);
-    }
-
-    private static async Task CreateEmptyFileAsync(string outputPath, CancellationToken token)
-    {
-        var emptyStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096, useAsync: true);
-        await using (emptyStream.ConfigureAwait(false))
+        var compressed = ArrayPool<byte>.Shared.Rent(header.InputLength);
+        var raw = ArrayPool<byte>.Shared.Rent(header.OutputLength);
+        try
         {
-            await emptyStream.FlushAsync(token).ConfigureAwait(false);
+            input.ReadExactly(compressed.AsSpan(0, header.InputLength));
+            Lz4BlockCodec.Decode(compressed.AsSpan(0, header.InputLength), raw.AsSpan(0, header.OutputLength), header.OutputLength);
+            hasher?.AppendData(raw.AsSpan(0, header.OutputLength));
+            return ToRawHashResult(hasher, header.OutputLength);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(raw);
+            ArrayPool<byte>.Shared.Return(compressed);
         }
     }
 
-    private static async Task CopyStoredRawPayloadAsync(Stream input, string outputPath, int inputLength, Lz4FormatOptions options, CancellationToken token)
+    public static FileFormatRawHashResult ComputeRawHashes(
+        ReadOnlySpan<byte> wrapped,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options)
     {
-        var outputStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, options.BufferSize, useAsync: true);
+        options.Validate();
+        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
+        var header = ReadHeader(wrapped.Length, wrapped, options);
+        if (header.OutputLength == 0)
+        {
+            using var emptyHasher = AscfRawContentHasher.Create(algorithms);
+            return ToRawHashResult(emptyHasher, 0);
+        }
+
+        if (header.OutputLength > options.MaxInMemoryDecodeBytes)
+        {
+            throw new InvalidDataException($"Wrapped LZ4 output length is too large for an in-memory hash ({header.OutputLength} bytes).");
+        }
+
+        var payload = wrapped.Slice(HeaderSize, header.InputLength);
+        using var hasher = AscfRawContentHasher.Create(algorithms);
+        if (Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength))
+        {
+            hasher?.AppendData(payload[..header.OutputLength]);
+            return ToRawHashResult(hasher, header.OutputLength);
+        }
+
+        var raw = ArrayPool<byte>.Shared.Rent(header.OutputLength);
+        try
+        {
+            Lz4BlockCodec.Decode(payload, raw.AsSpan(0, header.OutputLength), header.OutputLength);
+            hasher?.AppendData(raw.AsSpan(0, header.OutputLength));
+            return ToRawHashResult(hasher, header.OutputLength);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(raw);
+        }
+    }
+
+    private static async Task CreateEmptyFileAsync(FileFormatPaths.StagedFile output, Lz4FormatOptions options, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var emptyStream = output.OpenSequentialWrite(options.BufferSize);
+        await emptyStream.DisposeAsync().ConfigureAwait(false);
+    }
+
+    private static async Task CopyStoredRawPayloadAsync(
+        Stream input,
+        FileFormatPaths.StagedFile output,
+        int inputLength,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        var outputStream = output.OpenSequentialWrite(options.BufferSize);
         await using (outputStream.ConfigureAwait(false))
         {
             await FileFormatStreamReader.CopyExactlyAsync(input, outputStream, inputLength, options.CopyBufferSize, token).ConfigureAwait(false);
-            await outputStream.FlushAsync(token).ConfigureAwait(false);
         }
     }
 
-    private static async Task DecodeCompressedPayloadToRawFileAsync(string wrappedPath, string outputPath, int inputLength, int outputLength, CancellationToken token)
+    private static async Task DecodeCompressedPayloadToRawFileAsync(
+        Stream input,
+        string wrappedPath,
+        FileFormatPaths.StagedFile output,
+        int inputLength,
+        int outputLength,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        if (outputLength < options.MemoryMappedDecodeThreshold)
+        {
+            await DecodeSmallCompressedPayloadToRawFileAsync(input, output, inputLength, outputLength, options, token).ConfigureAwait(false);
+            return;
+        }
+
+        await DecodeMemoryMappedCompressedPayloadToRawFileAsync(wrappedPath, output, inputLength, outputLength, options, token)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task DecodeSmallCompressedPayloadToRawFileAsync(
+        Stream input,
+        FileFormatPaths.StagedFile output,
+        int inputLength,
+        int outputLength,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        var compressed = GC.AllocateUninitializedArray<byte>(inputLength);
+        var raw = GC.AllocateUninitializedArray<byte>(outputLength);
+        await input.ReadExactlyAsync(compressed.AsMemory(0, inputLength), token).ConfigureAwait(false);
+        Lz4BlockCodec.Decode(compressed, 0, inputLength, raw, 0, outputLength);
+
+        var outputStream = output.OpenSequentialWrite(options.BufferSize);
+        await using (outputStream.ConfigureAwait(false))
+        {
+            await outputStream.WriteAsync(raw.AsMemory(0, outputLength), token).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task DecodeMemoryMappedCompressedPayloadToRawFileAsync(
+        string wrappedPath,
+        FileFormatPaths.StagedFile output,
+        int inputLength,
+        int outputLength,
+        Lz4FormatOptions options,
+        CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
 
-        var mappedOutputStream = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 4096, FileOptions.SequentialScan);
+        var mappedOutputStream = output.OpenRandomReadWrite(options.BufferSize);
         await using (mappedOutputStream.ConfigureAwait(false))
         {
             mappedOutputStream.SetLength(outputLength);
@@ -354,16 +525,21 @@ public static class WrappedLz4FileFormat
         }
     }
 
-    private static async Task<WriteResult> WriteSmallFileAsync(string sourcePath, string outputPath, Lz4FormatOptions options, CancellationToken token)
+    private static async Task<HashedWriteResult> WriteSmallFileAsync(
+        string sourcePath,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options,
+        CancellationToken token)
     {
         var raw = await File.ReadAllBytesAsync(sourcePath, token).ConfigureAwait(false);
-        var maxStoredLength = raw.Length == 0 ? 0 : Math.Max(raw.Length, Lz4BlockCodec.MaxCompressedLength(raw.Length));
-        var storedBuffer = maxStoredLength == 0 ? Array.Empty<byte>() : ArrayPool<byte>.Shared.Rent(maxStoredLength);
+        using var hasher = AscfRawContentHasher.Create(algorithms);
+        hasher?.AppendData(raw);
+        var maxCompressedLength = Lz4BlockCodec.MaxUsefulCompressedLength(raw.Length);
+        var storedBuffer = maxCompressedLength == 0 ? Array.Empty<byte>() : ArrayPool<byte>.Shared.Rent(maxCompressedLength);
         try
         {
-            var encoded = raw.Length == 0
-                ? new Lz4BlockCodec.EncodedBlock(0, 0)
-                : Lz4BlockCodec.Encode(raw, storedBuffer.AsSpan(0, maxStoredLength));
+            var encoded = EncodeWrappedPayload(raw, storedBuffer.AsSpan(0, maxCompressedLength));
             var payload = encoded.StoresRaw
                 ? raw.AsMemory(0, raw.Length)
                 : storedBuffer.AsMemory(0, encoded.StoredLength);
@@ -371,15 +547,16 @@ public static class WrappedLz4FileFormat
             var header = new byte[HeaderSize];
             WriteHeader(header, raw.Length, encoded.StoredLength);
 
-            var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, options.BufferSize, useAsync: true);
+            using var staged = FileFormatPaths.CreateStagedFile(outputPath);
+            var output = staged.OpenSequentialWrite(options.BufferSize);
             await using (output.ConfigureAwait(false))
             {
                 await output.WriteAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
                 await output.WriteAsync(payload, token).ConfigureAwait(false);
-                await output.FlushAsync(token).ConfigureAwait(false);
             }
 
-            return new WriteResult(raw.LongLength, HeaderSize + encoded.StoredLength);
+            staged.Commit();
+            return new HashedWriteResult(FinalizeRawHashes(hasher), raw.LongLength, HeaderSize + encoded.StoredLength);
         }
         finally
         {
@@ -390,7 +567,12 @@ public static class WrappedLz4FileFormat
         }
     }
 
-    private static unsafe WriteResult WriteMemoryMappedFile(string sourcePath, string outputPath, Lz4FormatOptions options, CancellationToken token)
+    private static unsafe HashedWriteResult WriteMemoryMappedFile(
+        string sourcePath,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options,
+        CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
 
@@ -401,41 +583,50 @@ public static class WrappedLz4FileFormat
         using var sourceMap = MemoryMappedFile.CreateFromFile(sourceStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
         using var sourceView = sourceMap.CreateViewAccessor(0, rawLength, MemoryMappedFileAccess.Read);
 
+        AscfRawHashes hashes;
         byte* sourcePointer = null;
         try
         {
             sourceView.SafeMemoryMappedViewHandle.AcquirePointer(ref sourcePointer);
             var sourceData = sourcePointer + sourceView.PointerOffset;
+            using var hasher = AscfRawContentHasher.Create(algorithms);
+            hasher?.AppendData(new ReadOnlySpan<byte>(sourceData, rawLength));
 
             token.ThrowIfCancellationRequested();
 
-            using var outputStream = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, options.BufferSize, FileOptions.SequentialScan);
-            outputStream.SetLength((long)HeaderSize + rawLength);
-
-            using (var outputMap = MemoryMappedFile.CreateFromFile(outputStream, null, (long)HeaderSize + rawLength, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true))
-            using (var outputView = outputMap.CreateViewAccessor(HeaderSize, rawLength, MemoryMappedFileAccess.ReadWrite))
+            using var staged = FileFormatPaths.CreateStagedFile(outputPath);
+            using (var outputStream = staged.OpenRandomReadWrite(options.BufferSize))
             {
-                byte* outputPointer = null;
-                try
-                {
-                    outputView.SafeMemoryMappedViewHandle.AcquirePointer(ref outputPointer);
-                    var outputData = outputPointer + outputView.PointerOffset;
+                outputStream.SetLength((long)HeaderSize + rawLength);
 
-                    storedLength = Lz4BlockCodec.EncodeOrCopyRaw(sourceData, rawLength, outputData, rawLength).StoredLength;
-                    outputView.Flush();
-                }
-                finally
+                using (var outputMap = MemoryMappedFile.CreateFromFile(outputStream, null, (long)HeaderSize + rawLength, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true))
+                using (var outputView = outputMap.CreateViewAccessor(HeaderSize, rawLength, MemoryMappedFileAccess.ReadWrite))
                 {
-                    if (outputPointer != null)
+                    byte* outputPointer = null;
+                    try
                     {
-                        outputView.SafeMemoryMappedViewHandle.ReleasePointer();
+                        outputView.SafeMemoryMappedViewHandle.AcquirePointer(ref outputPointer);
+                        var outputData = outputPointer + outputView.PointerOffset;
+
+                        storedLength = Lz4BlockCodec.EncodeOrCopyRaw(sourceData, rawLength, outputData, rawLength).StoredLength;
+                        outputView.Flush();
+                    }
+                    finally
+                    {
+                        if (outputPointer != null)
+                        {
+                            outputView.SafeMemoryMappedViewHandle.ReleasePointer();
+                        }
                     }
                 }
+
+                token.ThrowIfCancellationRequested();
+
+                WriteHeader(outputStream, rawLength, storedLength);
             }
 
-            token.ThrowIfCancellationRequested();
-
-            WriteHeader(outputStream, rawLength, storedLength);
+            staged.Commit();
+            hashes = FinalizeRawHashes(hasher);
         }
         finally
         {
@@ -445,7 +636,22 @@ public static class WrappedLz4FileFormat
             }
         }
 
-        return new WriteResult(rawLength, (long)HeaderSize + storedLength);
+        return new HashedWriteResult(hashes, rawLength, (long)HeaderSize + storedLength);
+    }
+
+    private static Lz4BlockCodec.EncodedBlock EncodeWrappedPayload(ReadOnlySpan<byte> raw, Span<byte> compressedDestination)
+    {
+        if (raw.IsEmpty)
+        {
+            return new Lz4BlockCodec.EncodedBlock(0, 0);
+        }
+
+        if (compressedDestination.IsEmpty)
+        {
+            return new Lz4BlockCodec.EncodedBlock(raw.Length, raw.Length);
+        }
+
+        return Lz4BlockCodec.Encode(raw, compressedDestination);
     }
 
     private static void WriteHeader(FileStream outputStream, int rawLength, int storedLength)
@@ -455,8 +661,16 @@ public static class WrappedLz4FileFormat
         outputStream.Position = 0;
         outputStream.Write(header);
         outputStream.SetLength((long)HeaderSize + storedLength);
-        outputStream.Flush(flushToDisk: false);
     }
+
+    private static AscfRawHashes FinalizeRawHashes(AscfRawContentHasher? hasher)
+        => (hasher?.FinalizeHashes() ?? AscfRawHashBytes.Empty).ToPublic();
+
+    private static FileFormatHashResult ToSha1HashResult(FileFormatRawHashResult result)
+        => new(result.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1), result.RawSize);
+
+    private static FileFormatRawHashResult ToRawHashResult(AscfRawContentHasher? hasher, long rawSize)
+        => new(FinalizeRawHashes(hasher), rawSize);
 
     private static void ValidateHeader(long fileLength, int outputLength, int inputLength, long maxRawFileBytes)
     {

@@ -2,6 +2,7 @@ using ASCF.Files;
 using ASCF.Lz4;
 using ASCF.Transcoding;
 using Blake3;
+using K4os.Compression.LZ4.Legacy;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Security.Cryptography;
@@ -57,6 +58,56 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task BoundedStreamDecodeDoesNotReadNextPayload()
+    {
+        var raw = CreateMixedPayload(256 * 1024 + 23);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "bounded-source.ascf");
+        var outputPath = Path.Combine(_testDirectory, "bounded-output.raw");
+        byte[] sentinel = [0xAC, 0xCF, 0x42];
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        using var stream = new MemoryStream(encoded.Concat(sentinel).ToArray());
+
+        var result = await AscfFileReader
+            .DecodeStreamToRawFileAsync(stream, encoded.Length, outputPath, transform: null, AscfReaderOptions.Default, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        Assert.Equal(raw.Length, result.RawSize);
+        Assert.Equal(encoded.Length, stream.Position);
+        Assert.Equal(sentinel, stream.ToArray().AsSpan(encoded.Length).ToArray());
+        Assert.Equal(raw, await File.ReadAllBytesAsync(outputPath));
+    }
+
+    [Fact]
+    public async Task IdentifyAsyncResetsTransformedStreamPosition()
+    {
+        var raw = CreateMixedPayload(128 * 1024 + 11);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "identify-stream.ascf");
+        AscfBufferTransform transform = static buffer =>
+        {
+            foreach (ref var value in buffer)
+            {
+                value ^= 0x5A;
+            }
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        transform(encoded);
+        using var stream = new MemoryStream(encoded);
+
+        var format = await EncodedFileFormatIdentifier
+            .IdentifyAsync(stream, encoded.Length, transform, EncodedFileFormatIdentificationOptions.Default, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        Assert.Equal(EncodedFileFormat.Ascf, format);
+        Assert.Equal(0, stream.Position);
+    }
+
+    [Fact]
     public async Task WriteFileCanStoreSha1RawHash()
     {
         var raw = CreateMixedPayload(512 * 1024 + 29);
@@ -90,6 +141,43 @@ public sealed class AscfTests : IDisposable
 
         Assert.Null(hashes.Sha1);
         Assert.Equal(ComputeBlake3Hex(raw), hashes.Blake3);
+    }
+
+    [Fact]
+    public async Task DecodeWithStoredHashesReturnsHeaderHashes()
+    {
+        var raw = CreateMixedPayload(512 * 1024 + 41);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "stored-hash-decode.ascf");
+        var fileDecodedPath = Path.Combine(_testDirectory, "stored-hash-file.raw");
+        var streamDecodedPath = Path.Combine(_testDirectory, "stored-hash-stream.raw");
+        var options = AscfWriterOptions.Default with
+        {
+            RawHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+        var readOptions = AscfReaderOptions.Default with
+        {
+            RequiredStoredHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, options, CancellationToken.None);
+        var fileResult = await AscfFileReader
+            .DecodeFileToFileWithStoredHashesAsync(ascfPath, fileDecodedPath, readOptions, CancellationToken.None);
+        await using var stream = File.OpenRead(ascfPath);
+        var streamResult = await AscfFileReader
+            .DecodeStreamToFileWithStoredHashesAsync(stream, streamDecodedPath, transform: null, readOptions, CancellationToken.None);
+        var arrayResult = AscfFileReader.DecodeToArrayWithStoredHashes(await File.ReadAllBytesAsync(ascfPath), readOptions);
+        var expectedBlake3 = ComputeBlake3Hex(raw);
+
+        Assert.Equal(raw.Length, fileResult.RawSize);
+        Assert.Equal(raw.Length, streamResult.RawSize);
+        Assert.Equal(raw.Length, arrayResult.RawSize);
+        Assert.Equal(expectedBlake3, fileResult.StoredHashes.Blake3);
+        Assert.Equal(expectedBlake3, streamResult.StoredHashes.Blake3);
+        Assert.Equal(expectedBlake3, arrayResult.StoredHashes.Blake3);
+        Assert.Equal(raw, await File.ReadAllBytesAsync(fileDecodedPath));
+        Assert.Equal(raw, await File.ReadAllBytesAsync(streamDecodedPath));
+        Assert.Equal(raw, arrayResult.Raw);
     }
 
     [Fact]
@@ -642,6 +730,31 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task CompleteFileDecodeWithSingleWorkerPreservesRawBytes()
+    {
+        var raw = CreateMixedPayload((AscfFileFormat.MinRawChunkBytes * 3) + 37);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "single-worker.ascf");
+        var decodedPath = Path.Combine(_testDirectory, "single-worker.raw");
+        var writeOptions = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes
+        };
+        var readOptions = AscfReaderOptions.Default with
+        {
+            ParallelDecodeWorkerCount = 1
+        };
+        var expectedHash = Convert.ToHexString(SHA1.HashData(raw));
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, writeOptions, CancellationToken.None);
+        var result = await AscfFileReader.DecodeFileToRawFileAsync(ascfPath, decodedPath, readOptions, CancellationToken.None);
+
+        Assert.Equal(raw.Length, result.RawSize);
+        Assert.Equal(expectedHash, result.Hashes.Sha1);
+        Assert.Equal(raw, await File.ReadAllBytesAsync(decodedPath));
+    }
+
+    [Fact]
     public async Task ParallelDecodeStoredRawPreservesRawBytes()
     {
         var raw = CreateIncompressiblePayload((AscfFileFormat.MinRawChunkBytes * 4) + 17);
@@ -785,6 +898,91 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task WrappedLz4HashHelpersReturnSelectedRawHashes()
+    {
+        var raw = CreateMixedPayload(512 * 1024 + 47);
+        var sourcePath = WriteSource(raw);
+        var wrappedPath = Path.Combine(_testDirectory, "wrapped-hashes.llz4");
+        var algorithms = AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3;
+
+        var writeResult = await WrappedLz4FileFormat
+            .WriteFromRawFileWithHashAsync(sourcePath, wrappedPath, algorithms, CancellationToken.None);
+        var header = WrappedLz4FileFormat.ReadHeader(new FileInfo(wrappedPath).Length, await ReadHeaderAsync(wrappedPath, WrappedLz4FileFormat.HeaderSize));
+        var fileHashes = await WrappedLz4FileFormat
+            .ComputeRawHashesAsync(
+                wrappedPath,
+                header,
+                algorithms,
+                AscfFileFormat.DefaultBufferSize,
+                AscfFileFormat.DefaultBufferSize,
+                CancellationToken.None);
+        var bufferHashes = WrappedLz4FileFormat.ComputeRawHashes(
+            await File.ReadAllBytesAsync(wrappedPath),
+            algorithms,
+            Lz4FormatOptions.Default);
+        var expectedSha1 = Convert.ToHexString(SHA1.HashData(raw));
+        var expectedBlake3 = ComputeBlake3Hex(raw);
+
+        Assert.Equal(expectedSha1, writeResult.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, writeResult.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(expectedSha1, fileHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, fileHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(expectedSha1, bufferHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, bufferHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(raw.Length, writeResult.OriginalSize);
+        Assert.Equal(raw.Length, fileHashes.RawSize);
+        Assert.Equal(raw.Length, bufferHashes.RawSize);
+    }
+
+    [Fact]
+    public async Task WrappedLz4ExtractKeepsExistingOutputOnFailure()
+    {
+        var raw = new byte[512 * 1024 + 53];
+        var sourcePath = WriteSource(raw);
+        var wrappedPath = Path.Combine(_testDirectory, "wrapped-corrupt.llz4");
+        var outputPath = Path.Combine(_testDirectory, "wrapped-corrupt.raw");
+        byte[] existing = [0x42, 0xAC, 0xCF];
+
+        await WrappedLz4FileFormat.WriteFromRawFileAsync(sourcePath, wrappedPath, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(wrappedPath);
+        encoded.AsSpan(WrappedLz4FileFormat.HeaderSize).Clear();
+        await File.WriteAllBytesAsync(wrappedPath, encoded);
+        await File.WriteAllBytesAsync(outputPath, existing);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            WrappedLz4FileFormat.ExtractToRawFileAsync(wrappedPath, outputPath, CancellationToken.None));
+
+        Assert.Equal(existing, await File.ReadAllBytesAsync(outputPath));
+        AssertNoStagingFiles(outputPath);
+    }
+
+    [Fact]
+    public async Task Lz4StreamExtractKeepsExistingOutputOnFailure()
+    {
+        var raw = CreateMixedPayload(256 * 1024 + 21);
+        var compressedPath = Path.Combine(_testDirectory, "stream-corrupt.lz4");
+        var outputPath = Path.Combine(_testDirectory, "stream-corrupt.raw");
+        byte[] existing = [0xA5, 0xCF, 0x17];
+
+        await WriteLz4StreamAsync(raw, compressedPath);
+        var encoded = await File.ReadAllBytesAsync(compressedPath);
+        Array.Resize(ref encoded, encoded.Length / 2);
+        await File.WriteAllBytesAsync(compressedPath, encoded);
+        await File.WriteAllBytesAsync(outputPath, existing);
+
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            Lz4StreamFormat.ExtractToRawFileAsync(
+                compressedPath,
+                outputPath,
+                AscfFileFormat.DefaultBufferSize,
+                AscfFileFormat.DefaultBufferSize,
+                CancellationToken.None));
+
+        Assert.Equal(existing, await File.ReadAllBytesAsync(outputPath));
+        AssertNoStagingFiles(outputPath);
+    }
+
+    [Fact]
     public async Task WriteEmptyWrappedLz4WithMemoryMappedThresholdZero()
     {
         var sourcePath = WriteSource([]);
@@ -800,6 +998,32 @@ public sealed class AscfTests : IDisposable
         Assert.Equal(0, result.OriginalSize);
         Assert.Equal(WrappedLz4FileFormat.HeaderSize, result.CompressedSize);
         Assert.Empty(decoded);
+    }
+
+    [Fact]
+    public async Task WrappedLz4DecodeThresholdsPreserveRawBytes()
+    {
+        var raw = CreateMixedPayload(512 * 1024 + 61);
+        var sourcePath = WriteSource(raw);
+        var wrappedPath = Path.Combine(_testDirectory, "wrapped-decode-threshold.llz4");
+        var pooledPath = Path.Combine(_testDirectory, "wrapped-decode-pooled.raw");
+        var mappedPath = Path.Combine(_testDirectory, "wrapped-decode-mapped.raw");
+        var mappedOptions = Lz4FormatOptions.Default with
+        {
+            MemoryMappedDecodeThreshold = 0
+        };
+
+        await WrappedLz4FileFormat.WriteFromRawFileAsync(sourcePath, wrappedPath, CancellationToken.None);
+        var header = WrappedLz4FileFormat.ReadHeader(
+            new FileInfo(wrappedPath).Length,
+            await ReadHeaderAsync(wrappedPath, WrappedLz4FileFormat.HeaderSize));
+
+        await WrappedLz4FileFormat.ExtractToRawFileAsync(wrappedPath, pooledPath, CancellationToken.None);
+        await WrappedLz4FileFormat.ExtractToRawFileAsync(wrappedPath, mappedPath, mappedOptions, CancellationToken.None);
+
+        Assert.True(header.InputLength < header.OutputLength);
+        Assert.Equal(raw, await File.ReadAllBytesAsync(pooledPath));
+        Assert.Equal(raw, await File.ReadAllBytesAsync(mappedPath));
     }
 
     [Fact]
@@ -1148,6 +1372,16 @@ public sealed class AscfTests : IDisposable
             var read = await input.ReadAsync(header).ConfigureAwait(false);
             Assert.Equal(byteCount, read);
             return header;
+        }
+    }
+
+    private static async Task WriteLz4StreamAsync(byte[] raw, string path)
+    {
+        var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, AscfFileFormat.DefaultBufferSize, useAsync: true);
+        await using (output.ConfigureAwait(false))
+        using (var lz4 = new LZ4Stream(output, LZ4StreamMode.Compress, LZ4StreamFlags.HighCompression))
+        {
+            await lz4.WriteAsync(raw).ConfigureAwait(false);
         }
     }
 

@@ -62,7 +62,6 @@ public static class AscfFileWriter
         await using (output.ConfigureAwait(false))
         {
             await WriteFileAsync(sourcePath, output, options, token).ConfigureAwait(false);
-            await output.FlushAsync(token).ConfigureAwait(false);
             storedSize = output.Length;
         }
 
@@ -81,7 +80,6 @@ public static class AscfFileWriter
         await using (output.ConfigureAwait(false))
         {
             var result = await WriteFileToStreamWithHashAsync(sourcePath, output, options, token).ConfigureAwait(false);
-            await output.FlushAsync(token).ConfigureAwait(false);
             writeResult = new HashedWriteResult(result.Hashes, result.RawSize, output.Length);
         }
 
@@ -235,7 +233,6 @@ public static class AscfFileWriter
                     GetHeaderRawHashes(written.RawHashes, options),
                     token)
                 .ConfigureAwait(false);
-            await output.FlushAsync(token).ConfigureAwait(false);
             result = (written.RawSize, output.Length, written.RawHashes);
         }
 
@@ -334,7 +331,6 @@ public static class AscfFileWriter
                         token)
                     .ConfigureAwait(false);
 
-                await output.FlushAsync(token).ConfigureAwait(false);
                 result = (rawLength, output.Length, rawHashes);
             }
         }
