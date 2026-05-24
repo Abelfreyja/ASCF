@@ -9,10 +9,11 @@ namespace ASCF;
 public static class AscfFileReader
 {
     public readonly record struct DecodeResult(AscfRawHashes Hashes, long RawSize);
-    public readonly record struct StoredStreamResult(AscfRawHashes Hashes, long RawSize, long StoredSize);
+    public readonly record struct StoredStreamResult(AscfRawHashes Hashes, AscfRawHashes StoredHashes, long RawSize, long StoredSize);
 
     private readonly record struct DecodeFileResult(AscfRawHashes Hashes, long RawSize, bool HasHashes);
     private readonly record struct DecodedChunkResult(long RawSize, long EncodedOffset, List<AscfChunkIndexEntry> Entries);
+    private readonly record struct ChunkRange(int Start, int End);
 
     private sealed class DecodedRawChunk(PooledBufferOwner raw) : IDisposable
     {
@@ -79,6 +80,24 @@ public static class AscfFileReader
         return ReadHeader(input, options).RawHashes.ToPublic();
     }
 
+    public static AscfFileMetadata ReadMetadata(string path)
+        => ReadMetadata(path, AscfReaderOptions.Default);
+
+    public static AscfFileMetadata ReadMetadata(string path, AscfReaderOptions options)
+    {
+        options.Validate();
+        using var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: options.BufferSize,
+            FileOptions.SequentialScan);
+
+        var header = ReadHeader(input, options);
+        return ToMetadata(header, input.Length);
+    }
+
     public static Task<AscfRawHashes> ReadRawHashesAsync(string path, CancellationToken token)
         => ReadRawHashesAsync(path, AscfReaderOptions.Default, token);
 
@@ -96,6 +115,51 @@ public static class AscfFileReader
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
             return fileHeader.RawHashes.ToPublic();
+        }
+    }
+
+    public static Task<AscfFileMetadata> ReadMetadataAsync(string path, CancellationToken token)
+        => ReadMetadataAsync(path, AscfReaderOptions.Default, token);
+
+    public static async Task<AscfFileMetadata> ReadMetadataAsync(string path, AscfReaderOptions options, CancellationToken token)
+    {
+        options.Validate();
+        var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: options.BufferSize,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using (input.ConfigureAwait(false))
+        {
+            var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
+            return ToMetadata(fileHeader, input.Length);
+        }
+    }
+
+    /// <summary> reads metadata and snaps an encoded byte count to a chunk aligned resume point </summary>
+    public static Task<AscfResumeInfo> ReadResumeInfoAsync(string path, long encodedBytes, CancellationToken token)
+        => ReadResumeInfoAsync(path, encodedBytes, AscfReaderOptions.Default, token);
+
+    /// <summary> reads metadata and snaps an encoded byte count to a chunk aligned resume point </summary>
+    public static async Task<AscfResumeInfo> ReadResumeInfoAsync(string path, long encodedBytes, AscfReaderOptions options, CancellationToken token)
+    {
+        options.Validate();
+        var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: options.BufferSize,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using (input.ConfigureAwait(false))
+        {
+            var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
+            var metadata = ToMetadata(fileHeader, input.Length);
+            var position = await ReadResumePositionFromEndAsync(input, fileHeader, metadata, encodedBytes, token)
+                .ConfigureAwait(false);
+            return new AscfResumeInfo(metadata, position);
         }
     }
 
@@ -304,10 +368,7 @@ public static class AscfFileReader
             options,
             encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
 
-        var output = FileFormatPaths.OpenSequentialStagingWrite(
-            stagedFile.StagingPath,
-            options.BufferSize,
-            GetEncodedPreallocationSize(fileHeader));
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
             using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
@@ -340,15 +401,16 @@ public static class AscfFileReader
                 }
 
                 var hashes = FinalizeHashes(fileHeader, hasher);
+                var storedHashes = fileHeader.RawHashes.Merge(hashes);
                 await RewriteStoredHeaderAsync(
                         output,
                         fileHeader,
                         output.Length,
-                        fileHeader.RawHashes.Merge(hashes),
+                        storedHashes,
                         token)
                     .ConfigureAwait(false);
                 await output.FlushAsync(token).ConfigureAwait(false);
-                storedResult = new StoredStreamResult(GetResultHashes(hashes, options), decoded.RawSize, output.Length);
+                storedResult = new StoredStreamResult(GetResultHashes(hashes, options), storedHashes.ToPublic(), decoded.RawSize, output.Length);
             }
             finally
             {
@@ -467,8 +529,8 @@ public static class AscfFileReader
             var decodeMode = options.ResolveParallelDecodeMode(computeHash);
             var result = decodeMode switch
             {
-                AscfParallelDecodeMode.OrderedWrite => await DecodeCompleteFileParallelOrderedAsync(input, stagedFile.StagingPath, fileHeader, chunkIndex, options, computeHash, token).ConfigureAwait(false),
-                AscfParallelDecodeMode.RandomWrite => await DecodeCompleteFileParallelRandomWriteAsync(input, stagedFile.StagingPath, fileHeader, chunkIndex, options, computeHash, token).ConfigureAwait(false),
+                AscfParallelDecodeMode.OrderedWrite => await DecodeCompleteFileParallelOrderedAsync(input, stagedFile, fileHeader, chunkIndex, options, computeHash, token).ConfigureAwait(false),
+                AscfParallelDecodeMode.RandomWrite => await DecodeCompleteFileParallelRandomWriteAsync(input, stagedFile, fileHeader, chunkIndex, options, computeHash, token).ConfigureAwait(false),
                 _ => throw new ArgumentOutOfRangeException(nameof(options), decodeMode, "Parallel decode mode is not supported.")
             };
             stagedFile.Commit();
@@ -507,17 +569,16 @@ public static class AscfFileReader
 
     private static async Task<DecodeFileResult> DecodeCompleteFileParallelRandomWriteAsync(
         FileStream input,
-        string outputPath,
+        FileFormatPaths.StagedFile stagedFile,
         AscfFileHeader fileHeader,
         AscfChunkIndex chunkIndex,
         AscfReaderOptions options,
         bool computeHash,
         CancellationToken token)
     {
-        var output = FileFormatPaths.OpenRandomStagingReadWrite(outputPath, options.BufferSize, fileHeader.RawSize);
+        var output = stagedFile.OpenRandomReadWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
-            output.SetLength(fileHeader.RawSize);
             await DecodeChunksParallelRandomWriteAsync(
                     input.SafeFileHandle,
                     output.SafeFileHandle,
@@ -542,18 +603,16 @@ public static class AscfFileReader
 
     private static async Task<DecodeFileResult> DecodeCompleteFileParallelOrderedAsync(
         FileStream input,
-        string outputPath,
+        FileFormatPaths.StagedFile stagedFile,
         AscfFileHeader fileHeader,
         AscfChunkIndex chunkIndex,
         AscfReaderOptions options,
         bool computeHash,
         CancellationToken token)
     {
-        var output = FileFormatPaths.OpenSequentialStagingWrite(outputPath, options.BufferSize, fileHeader.RawSize);
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
-            output.SetLength(fileHeader.RawSize);
-            output.Position = 0;
             using var hasher = computeHash ? CreateRawHasher(GetHashAlgorithms(fileHeader, options)) : null;
             await DecodeChunksParallelOrderedAsync(
                     input.SafeFileHandle,
@@ -604,10 +663,7 @@ public static class AscfFileReader
 
             var wrappedRawSize = (int)fileHeader.RawSize;
 
-            var output = FileFormatPaths.OpenSequentialStagingWrite(
-                stagedFile.StagingPath,
-                options.BufferSize,
-                (long)WrappedLz4FileFormat.HeaderSize + fileHeader.RawSize);
+            var output = stagedFile.OpenSequentialWrite(options.BufferSize);
             await using (output.ConfigureAwait(false))
             {
                 await WriteWrappedRawHeaderAsync(output, wrappedRawSize, token).ConfigureAwait(false);
@@ -794,7 +850,7 @@ public static class AscfFileReader
             options,
             encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
 
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, fileHeader.RawSize);
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
             using var hasher = computeHash ? CreateRawHasher(GetHashAlgorithms(fileHeader, options)) : null;
@@ -945,12 +1001,30 @@ public static class AscfFileReader
     private static AscfFileHeader ValidateHeader(ReadOnlySpan<byte> header, AscfReaderOptions options, long? encodedLength)
     {
         var fileHeader = AscfFileHeaderCodec.Read(header, options.MaxRawFileBytes);
+        ValidateRequiredStoredHashes(fileHeader, options);
         if (encodedLength.HasValue)
         {
             ValidateEncodedSize(fileHeader, encodedLength.Value);
         }
 
         return fileHeader;
+    }
+
+    private static void ValidateRequiredStoredHashes(AscfFileHeader header, AscfReaderOptions options)
+    {
+        ValidateRequiredStoredHash(header, options, AscfRawHashAlgorithms.Sha1);
+        ValidateRequiredStoredHash(header, options, AscfRawHashAlgorithms.Blake3);
+    }
+
+    private static void ValidateRequiredStoredHash(AscfFileHeader header, AscfReaderOptions options, AscfRawHashAlgorithms algorithm)
+    {
+        if (!AscfRawHashAlgorithmFlags.Has(options.RequiredStoredHashAlgorithms, algorithm)
+            || header.RawHashes.HasHash(algorithm))
+        {
+            return;
+        }
+
+        throw new InvalidDataException($".ascf raw {AscfRawHashAlgorithmFlags.GetDisplayName(algorithm)} hash is missing.");
     }
 
     private static void ValidateEncodedSize(AscfFileHeader header, long actualLength)
@@ -961,8 +1035,14 @@ public static class AscfFileReader
         }
     }
 
-    private static long GetEncodedPreallocationSize(AscfFileHeader header)
-        => header.EncodedSize > 0 ? header.EncodedSize : 0;
+    private static AscfFileMetadata ToMetadata(AscfFileHeader header, long fileLength)
+        => new(
+            header.RawSize,
+            header.EncodedSize > 0 ? header.EncodedSize : fileLength,
+            header.RawChunkSize,
+            header.ChunkCount,
+            header.StreamId,
+            header.RawHashes.ToPublic());
 
     private static bool PartialEncodedSizeExceeded(AscfFileHeader header, long partialLength)
         => header.EncodedSize != 0 && partialLength > header.EncodedSize;
@@ -1179,21 +1259,226 @@ public static class AscfFileReader
 
     private static async Task<AscfChunkIndex> ReadChunkIndexFromEndAsync(FileStream input, AscfFileHeader fileHeader, CancellationToken token)
     {
+        var footer = await ReadIndexFooterFromEndAsync(input, fileHeader, token).ConfigureAwait(false);
+        input.Position = footer.IndexOffset;
+        var chunkIndex = await ReadChunkIndexEntriesAsync(input, footer, token).ConfigureAwait(false);
+        chunkIndex.ValidateForRandomAccess(fileHeader, footer.IndexOffset);
+        return chunkIndex;
+    }
+
+    private static async Task<AscfResumePosition> ReadResumePositionFromEndAsync(
+        FileStream input,
+        AscfFileHeader fileHeader,
+        AscfFileMetadata metadata,
+        long encodedBytes,
+        CancellationToken token)
+    {
+        if (encodedBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(encodedBytes), encodedBytes, "Encoded byte count must be non-negative.");
+        }
+
+        var footer = await ReadIndexFooterFromEndAsync(input, fileHeader, token).ConfigureAwait(false);
+        if (encodedBytes >= metadata.EncodedSize)
+        {
+            return new AscfResumePosition(metadata.ChunkCount, metadata.EncodedSize, metadata.RawSize, IsComplete: true);
+        }
+
+        if (encodedBytes < AscfFileFormat.HeaderSize)
+        {
+            return new AscfResumePosition(0, 0, 0, IsComplete: false);
+        }
+
+        if (footer.ChunkCount == 0)
+        {
+            return new AscfResumePosition(0, AscfFileFormat.HeaderSize, 0, IsComplete: false);
+        }
+
+        if (footer.ChunkCount <= FileFormatBuffers.IndexDirectReadThreshold)
+        {
+            return await ReadResumePositionFromBufferedIndexAsync(input, fileHeader, metadata, footer, encodedBytes, token)
+                .ConfigureAwait(false);
+        }
+
+        var entryBytes = new byte[AscfFileFormat.IndexEntrySize];
+        if (encodedBytes >= footer.IndexOffset)
+        {
+            await ValidateFinalIndexEntryAsync(input, fileHeader, footer, entryBytes, token).ConfigureAwait(false);
+            return new AscfResumePosition(footer.ChunkCount, footer.IndexOffset, fileHeader.RawSize, IsComplete: false);
+        }
+
+        var left = 0;
+        var right = footer.ChunkCount - 1;
+        AscfChunkIndexEntry? candidate = null;
+        while (left <= right)
+        {
+            var entryIndex = left + ((right - left) / 2);
+            var entry = await ReadIndexEntryAtAsync(input, footer, entryIndex, entryBytes, token).ConfigureAwait(false);
+            AscfChunkIndexValidation.ValidateEntryAgainstHeader(entry, fileHeader, footer.IndexOffset, entryIndex);
+
+            if (encodedBytes < entry.NextEncodedOffset)
+            {
+                candidate = entry;
+                right = entryIndex - 1;
+            }
+            else
+            {
+                left = entryIndex + 1;
+            }
+        }
+
+        if (!candidate.HasValue)
+        {
+            await ValidateFinalIndexEntryAsync(input, fileHeader, footer, entryBytes, token).ConfigureAwait(false);
+            return new AscfResumePosition(footer.ChunkCount, footer.IndexOffset, fileHeader.RawSize, IsComplete: false);
+        }
+
+        var resumeEntry = candidate.Value;
+        if (resumeEntry.ChunkIndex > 0)
+        {
+            var previousEntryIndex = resumeEntry.ChunkIndex - 1;
+            var previousEntry = await ReadIndexEntryAtAsync(input, footer, previousEntryIndex, entryBytes, token)
+                .ConfigureAwait(false);
+            AscfChunkIndexValidation.ValidateEntryAgainstHeader(previousEntry, fileHeader, footer.IndexOffset, previousEntryIndex);
+            AscfChunkIndexValidation.ValidateChunkOffset(resumeEntry, previousEntry.NextEncodedOffset);
+            if (previousEntry.NextEncodedOffset > encodedBytes)
+            {
+                throw new InvalidDataException(".ascf index entries are invalid.");
+            }
+        }
+        else
+        {
+            AscfChunkIndexValidation.ValidateChunkOffset(resumeEntry, AscfFileFormat.HeaderSize);
+        }
+
+        return new AscfResumePosition(
+            resumeEntry.ChunkIndex,
+            resumeEntry.ChunkOffset,
+            resumeEntry.RawOffset,
+            IsComplete: false);
+    }
+
+    private static async Task<AscfIndexFooter> ReadIndexFooterFromEndAsync(
+        FileStream input,
+        AscfFileHeader fileHeader,
+        CancellationToken token)
+    {
         if (input.Length < AscfFileFormat.HeaderSize + AscfFileFormat.IndexFooterSize)
         {
             throw new InvalidDataException(".ascf file is too short to contain an index footer.");
         }
 
-        input.Position = input.Length - AscfFileFormat.IndexFooterSize;
         var footerBytes = new byte[AscfFileFormat.IndexFooterSize];
-        await input.ReadExactlyAsync(footerBytes.AsMemory(0, footerBytes.Length), token).ConfigureAwait(false);
+        await ReadExactlyAtAsync(
+                input.SafeFileHandle,
+                footerBytes.AsMemory(0, footerBytes.Length),
+                input.Length - AscfFileFormat.IndexFooterSize,
+                token)
+            .ConfigureAwait(false);
         var footer = AscfChunkIndexCodec.ReadFooter(footerBytes, input.Length);
         ValidateFooterAgainstHeader(footer, fileHeader);
+        return footer;
+    }
 
-        input.Position = footer.IndexOffset;
-        var chunkIndex = await ReadChunkIndexEntriesAsync(input, footer, token).ConfigureAwait(false);
-        chunkIndex.ValidateForRandomAccess(fileHeader, footer.IndexOffset);
-        return chunkIndex;
+    private static async Task<AscfResumePosition> ReadResumePositionFromBufferedIndexAsync(
+        FileStream input,
+        AscfFileHeader fileHeader,
+        AscfFileMetadata metadata,
+        AscfIndexFooter footer,
+        long encodedBytes,
+        CancellationToken token)
+    {
+        var indexLength = checked((int)footer.IndexLength);
+        var indexBytes = ArrayPool<byte>.Shared.Rent(indexLength);
+        try
+        {
+            var indexMemory = indexBytes.AsMemory(0, indexLength);
+            await ReadExactlyAtAsync(input.SafeFileHandle, indexMemory, footer.IndexOffset, token)
+                .ConfigureAwait(false);
+
+            ValidateIndexChecksum(footer, AscfChecksum.ComputeXxHash3(indexBytes.AsSpan(0, indexLength)));
+            AscfChunkIndexEntry? lastEntry = null;
+            long expectedChunkOffset = AscfFileFormat.HeaderSize;
+            AscfResumePosition? resumePosition = null;
+            for (var i = 0; i < footer.ChunkCount; i++)
+            {
+                var entryBytes = indexBytes.AsSpan(
+                    i * AscfFileFormat.IndexEntrySize,
+                    AscfFileFormat.IndexEntrySize);
+                var entry = AscfChunkIndexCodec.ReadEntry(entryBytes);
+                AscfChunkIndexValidation.ValidateEntryAgainstHeader(entry, fileHeader, footer.IndexOffset, i);
+                AscfChunkIndexValidation.ValidateChunkOffset(entry, expectedChunkOffset);
+                lastEntry = entry;
+                expectedChunkOffset = entry.NextEncodedOffset;
+
+                if (!resumePosition.HasValue && encodedBytes < entry.NextEncodedOffset)
+                {
+                    resumePosition = new AscfResumePosition(entry.ChunkIndex, entry.ChunkOffset, entry.RawOffset, IsComplete: false);
+                }
+            }
+
+            if (!lastEntry.HasValue || lastEntry.Value.NextEncodedOffset != footer.IndexOffset)
+            {
+                throw new InvalidDataException(".ascf index entries do not match the file layout.");
+            }
+
+            return resumePosition
+                ?? new AscfResumePosition(metadata.ChunkCount, footer.IndexOffset, metadata.RawSize, IsComplete: false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(indexBytes);
+        }
+    }
+
+    private static async ValueTask<AscfChunkIndexEntry> ReadIndexEntryAtAsync(
+        FileStream input,
+        AscfIndexFooter footer,
+        int entryIndex,
+        byte[] entryBytes,
+        CancellationToken token)
+    {
+        if ((uint)entryIndex >= (uint)footer.ChunkCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(entryIndex), entryIndex, "Index entry is outside the chunk index.");
+        }
+
+        var entryOffset = checked(footer.IndexOffset + ((long)entryIndex * AscfFileFormat.IndexEntrySize));
+        await ReadExactlyAtAsync(
+                input.SafeFileHandle,
+                entryBytes.AsMemory(0, AscfFileFormat.IndexEntrySize),
+                entryOffset,
+                token)
+            .ConfigureAwait(false);
+        return AscfChunkIndexCodec.ReadEntry(entryBytes);
+    }
+
+    private static async ValueTask ValidateFinalIndexEntryAsync(
+        FileStream input,
+        AscfFileHeader fileHeader,
+        AscfIndexFooter footer,
+        byte[] entryBytes,
+        CancellationToken token)
+    {
+        var lastEntry = await ReadIndexEntryAtAsync(input, footer, footer.ChunkCount - 1, entryBytes, token)
+            .ConfigureAwait(false);
+        AscfChunkIndexValidation.ValidateEntryAgainstHeader(lastEntry, fileHeader, footer.IndexOffset, footer.ChunkCount - 1);
+        if (lastEntry.NextEncodedOffset != footer.IndexOffset)
+        {
+            throw new InvalidDataException(".ascf index entries do not match the file layout.");
+        }
+
+        if (footer.ChunkCount == 1)
+        {
+            AscfChunkIndexValidation.ValidateChunkOffset(lastEntry, AscfFileFormat.HeaderSize);
+            return;
+        }
+
+        var previousEntryIndex = footer.ChunkCount - 2;
+        var previousEntry = await ReadIndexEntryAtAsync(input, footer, previousEntryIndex, entryBytes, token)
+            .ConfigureAwait(false);
+        AscfChunkIndexValidation.ValidateEntryAgainstHeader(previousEntry, fileHeader, footer.IndexOffset, previousEntryIndex);
+        AscfChunkIndexValidation.ValidateChunkOffset(lastEntry, previousEntry.NextEncodedOffset);
     }
 
     private static AscfChunkIndex ReadChunkIndexEntries(Stream input, AscfIndexFooter footer)
@@ -1273,21 +1558,99 @@ public static class AscfFileReader
         int workerCount,
         CancellationToken token)
     {
+        var entries = chunkIndex.Entries;
+        if (entries.Count == 0)
+        {
+            return;
+        }
+
+        var rangeWorkerCount = Math.Min(workerCount, entries.Count);
         var parallelOptions = new ParallelOptions
         {
-            MaxDegreeOfParallelism = workerCount,
+            MaxDegreeOfParallelism = rangeWorkerCount,
             CancellationToken = token
         };
 
-        await Parallel.ForEachAsync(
-                chunkIndex.Entries,
+        await Parallel.ForAsync(
+                0,
+                rangeWorkerCount,
                 parallelOptions,
-                async (entry, cancellationToken) =>
+                async (workerIndex, cancellationToken) =>
                 {
-                    using var decoded = await DecodeChunkToBufferAsync(inputHandle, fileHeader, entry, cancellationToken).ConfigureAwait(false);
-                    await RandomAccess.WriteAsync(outputHandle, decoded.Raw, entry.RawOffset, cancellationToken).ConfigureAwait(false);
+                    var range = GetChunkRange(entries.Count, workerIndex, rangeWorkerCount);
+                    await DecodeAndWriteChunkRangeAsync(inputHandle, outputHandle, fileHeader, entries, range, cancellationToken)
+                        .ConfigureAwait(false);
                 })
             .ConfigureAwait(false);
+    }
+
+    private static async Task DecodeAndWriteChunkRangeAsync(
+        SafeFileHandle inputHandle,
+        SafeFileHandle outputHandle,
+        AscfFileHeader fileHeader,
+        IReadOnlyList<AscfChunkIndexEntry> entries,
+        ChunkRange range,
+        CancellationToken token)
+    {
+        var recordBuffer = ArrayPool<byte>.Shared.Rent(checked(AscfFileFormat.ChunkHeaderSize + fileHeader.RawChunkSize));
+        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
+        try
+        {
+            for (var i = range.Start; i < range.End; i++)
+            {
+                await DecodeAndWriteChunkAsync(inputHandle, outputHandle, fileHeader, entries[i], recordBuffer, rawBuffer, token)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rawBuffer);
+            ArrayPool<byte>.Shared.Return(recordBuffer);
+        }
+    }
+
+    private static async ValueTask DecodeAndWriteChunkAsync(
+        SafeFileHandle inputHandle,
+        SafeFileHandle outputHandle,
+        AscfFileHeader fileHeader,
+        AscfChunkIndexEntry entry,
+        byte[] recordBuffer,
+        byte[] rawBuffer,
+        CancellationToken token)
+    {
+        var recordLength = checked(AscfFileFormat.ChunkHeaderSize + entry.StoredLength);
+        await ReadExactlyAtAsync(inputHandle, recordBuffer.AsMemory(0, recordLength), entry.ChunkOffset, token).ConfigureAwait(false);
+
+        var header = recordBuffer.AsSpan(0, AscfFileFormat.ChunkHeaderSize);
+        var chunk = AscfChunkHeaderCodec.Read(header, fileHeader, entry.ChunkIndex, entry.RawOffset);
+        ValidateIndexEntry(ToIndexEntry(chunk, entry.ChunkOffset), entry);
+
+        var stored = recordBuffer.AsSpan(AscfFileFormat.ChunkHeaderSize, chunk.StoredLength);
+        ValidateStoredChecksumAndRawIfStoredRaw(chunk, stored);
+        if (chunk.StoresRaw)
+        {
+            await RandomAccess.WriteAsync(
+                    outputHandle,
+                    recordBuffer.AsMemory(AscfFileFormat.ChunkHeaderSize, chunk.RawLength),
+                    entry.RawOffset,
+                    token)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        Lz4BlockCodec.Decode(stored, rawBuffer.AsSpan(0, chunk.RawLength), chunk.RawLength);
+        ValidateRawChecksum(chunk, rawBuffer.AsSpan(0, chunk.RawLength));
+        await RandomAccess.WriteAsync(outputHandle, rawBuffer.AsMemory(0, chunk.RawLength), entry.RawOffset, token)
+            .ConfigureAwait(false);
+    }
+
+    private static ChunkRange GetChunkRange(int chunkCount, int workerIndex, int workerCount)
+    {
+        var baseLength = chunkCount / workerCount;
+        var extra = chunkCount % workerCount;
+        var start = (workerIndex * baseLength) + Math.Min(workerIndex, extra);
+        var length = baseLength + (workerIndex < extra ? 1 : 0);
+        return new ChunkRange(start, start + length);
     }
 
     private static async Task DecodeChunksParallelOrderedAsync(

@@ -57,8 +57,8 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         long storedSize;
-        var preallocationSize = GetSourceFilePreallocationSize(sourcePath, options);
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
+        ValidateSourceFileRawSize(sourcePath, options);
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
             await WriteFileAsync(sourcePath, output, options, token).ConfigureAwait(false);
@@ -76,8 +76,8 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         HashedWriteResult writeResult;
-        var preallocationSize = GetSourceFilePreallocationSize(sourcePath, options);
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
+        ValidateSourceFileRawSize(sourcePath, options);
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
             var result = await WriteFileToStreamWithHashAsync(sourcePath, output, options, token).ConfigureAwait(false);
@@ -160,7 +160,7 @@ public static class AscfFileWriter
         {
             using var hasher = CreateRawHasher(options.Format.RawHashAlgorithms | requiredHashAlgorithms);
             var chunkCount = AscfFileFormat.GetChunkCount(sourceInfo.Length, options.Format.RawChunkSize);
-            var streamId = Guid.NewGuid();
+            var streamId = GetStreamId(options.Format);
             await WriteHeaderAsync(destination, sourceInfo.Length, options.Format.RawChunkSize, chunkCount, streamId, 0, options, token)
                 .ConfigureAwait(false);
             var result = await WriteCompressedChunksAsync(source, destination, hasher, knownChunkCount: chunkCount, options, token)
@@ -214,12 +214,12 @@ public static class AscfFileWriter
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
         (long RawSize, long StoredSize, AscfRawHashBytes RawHashes) result;
-        var preallocationSize = GetSeekableStreamPreallocationSize(source, options);
-        var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
+        ValidateSeekableStreamRawSize(source, options);
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         using (var hasher = CreateRawHasher(options.RawHashAlgorithms | requiredHashAlgorithms))
         {
-            var streamId = Guid.NewGuid();
+            var streamId = GetStreamId(options);
             var writeOptions = new WriteOptions(options, null, null, null);
             await WriteHeaderAsync(output, 0, options.RawChunkSize, 0, streamId, 0, writeOptions, token).ConfigureAwait(false);
             var written = await WriteCompressedChunksAsync(source, output, hasher, knownChunkCount: null, writeOptions, token).ConfigureAwait(false);
@@ -311,13 +311,12 @@ public static class AscfFileWriter
         {
             source.Position = sourceOffset;
 
-            var preallocationSize = GetMaxEncodedSize(rawLength, options.RawChunkSize);
-            var output = FileFormatPaths.OpenSequentialStagingWrite(stagedFile.StagingPath, options.BufferSize, preallocationSize);
+            var output = stagedFile.OpenSequentialWrite(options.BufferSize);
             await using (output.ConfigureAwait(false))
             {
                 using var hasher = CreateRawHasher(options.RawHashAlgorithms | requiredHashAlgorithms);
                 var chunkCount = AscfFileFormat.GetChunkCount(rawLength, options.RawChunkSize);
-                var streamId = Guid.NewGuid();
+                var streamId = GetStreamId(options);
                 var writeOptions = new WriteOptions(options, null, null, null);
                 await WriteHeaderAsync(output, rawLength, options.RawChunkSize, chunkCount, streamId, 0, writeOptions, token).ConfigureAwait(false);
                 var entries = await WriteStoredRawChunksAsync(source, output, rawLength, chunkCount, options.RawChunkSize, hasher, token).ConfigureAwait(false);
@@ -1066,6 +1065,9 @@ public static class AscfFileWriter
         return AscfRawContentHasher.Create(algorithms);
     }
 
+    private static Guid GetStreamId(AscfWriterOptions options)
+        => options.StreamId ?? Guid.NewGuid();
+
     private static void ValidateHashOptions(AscfWriterOptions options)
     {
         options.Validate();
@@ -1081,34 +1083,21 @@ public static class AscfFileWriter
     private static AscfRawHashes GetResultHashes(AscfRawHashBytes rawHashes, AscfRawHashAlgorithms algorithms)
         => rawHashes.Filter(algorithms).ToPublic();
 
-    private static long GetSourceFilePreallocationSize(string sourcePath, AscfWriterOptions options)
+    private static void ValidateSourceFileRawSize(string sourcePath, AscfWriterOptions options)
     {
         var sourceInfo = new FileInfo(sourcePath);
         ValidateRawSize(sourceInfo.Length, options.MaxRawFileBytes);
-        return 0;
     }
 
-    private static long GetSeekableStreamPreallocationSize(Stream source, AscfWriterOptions options)
+    private static void ValidateSeekableStreamRawSize(Stream source, AscfWriterOptions options)
     {
         if (!source.CanSeek)
         {
-            return 0;
+            return;
         }
 
         var rawSize = Math.Max(0, checked(source.Length - source.Position));
         ValidateRawSize(rawSize, options.MaxRawFileBytes);
-        return 0;
-    }
-
-    private static long GetMaxEncodedSize(long rawSize, int rawChunkSize)
-    {
-        var chunkCount = AscfFileFormat.GetChunkCount(rawSize, rawChunkSize);
-        return checked(
-            AscfFileFormat.HeaderSize
-            + rawSize
-            + ((long)chunkCount * AscfFileFormat.ChunkHeaderSize)
-            + ((long)chunkCount * AscfFileFormat.IndexEntrySize)
-            + AscfFileFormat.IndexFooterSize);
     }
 
     private static async ValueTask WriteBytesAsync(Stream destination, ReadOnlyMemory<byte> buffer, WriteOptions options, CancellationToken token)

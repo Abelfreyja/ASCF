@@ -14,6 +14,7 @@ public sealed record AscfReaderOptions
     public int MaxParallelDecodeWorkerCount { get; init; } = AscfFileFormat.DefaultMaxParallelDecodeWorkerCount;
     public AscfParallelDecodeMode ParallelDecodeMode { get; init; } = AscfParallelDecodeMode.Auto;
     public AscfRawHashAlgorithms ResultHashAlgorithms { get; init; } = AscfRawHashAlgorithms.Sha1;
+    public AscfRawHashAlgorithms RequiredStoredHashAlgorithms { get; init; } = AscfRawHashAlgorithms.None;
 
     internal int GetParallelDecodeWorkerCount()
         => FileFormatWorkerCounts.Resolve(
@@ -37,6 +38,7 @@ public sealed record AscfReaderOptions
         FileFormatBuffers.ValidateBufferSize(BufferSize, nameof(BufferSize));
         ValidateParallelDecodeMode(ParallelDecodeMode);
         ValidateResultHashAlgorithms(ResultHashAlgorithms);
+        ValidateRequiredStoredHashAlgorithms(RequiredStoredHashAlgorithms);
         GetParallelDecodeWorkerCount();
     }
 
@@ -63,4 +65,7 @@ public sealed record AscfReaderOptions
 
     private static void ValidateResultHashAlgorithms(AscfRawHashAlgorithms algorithms)
         => AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(ResultHashAlgorithms));
+
+    private static void ValidateRequiredStoredHashAlgorithms(AscfRawHashAlgorithms algorithms)
+        => AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(RequiredStoredHashAlgorithms));
 }

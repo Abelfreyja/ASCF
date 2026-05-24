@@ -16,6 +16,7 @@ public sealed record AscfWriterOptions
     public long MaxCompressionPipelineBytes { get; init; } = AscfFileFormat.DefaultMaxCompressionPipelineBytes;
     public AscfRawHashAlgorithms RawHashAlgorithms { get; init; } = AscfRawHashAlgorithms.None;
     public AscfRawHashAlgorithms ResultHashAlgorithms { get; init; } = AscfRawHashAlgorithms.None;
+    public Guid? StreamId { get; init; }
 
     internal int GetCompressionWorkerCount()
         => FileFormatWorkerCounts.Resolve(

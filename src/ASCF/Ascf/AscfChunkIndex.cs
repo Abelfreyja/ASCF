@@ -1,4 +1,3 @@
-using ASCF.Lz4;
 using System.Runtime.InteropServices;
 
 namespace ASCF;
@@ -74,6 +73,47 @@ public sealed class AscfChunkIndex
         return false;
     }
 
+    /// <summary> snap the encoded byte count to the last complete chunk boundary. </summary>
+    public AscfResumePosition GetResumePosition(long encodedBytes, AscfFileMetadata metadata)
+    {
+        if (encodedBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(encodedBytes), encodedBytes, "Encoded byte count must be non-negative.");
+        }
+
+        if (_entries.Length != metadata.ChunkCount)
+        {
+            throw new InvalidDataException(".ascf index entries do not match the file metadata.");
+        }
+
+        if (metadata.EncodedSize > 0 && encodedBytes >= metadata.EncodedSize)
+        {
+            return new AscfResumePosition(metadata.ChunkCount, metadata.EncodedSize, metadata.RawSize, IsComplete: true);
+        }
+
+        if (encodedBytes < AscfFileFormat.HeaderSize)
+        {
+            return new AscfResumePosition(0, 0, 0, IsComplete: false);
+        }
+
+        if (_entries.Length == 0)
+        {
+            return new AscfResumePosition(0, AscfFileFormat.HeaderSize, 0, IsComplete: false);
+        }
+
+        for (var i = 0; i < _entries.Length; i++)
+        {
+            var entry = _entries[i];
+            if (encodedBytes < entry.NextEncodedOffset)
+            {
+                return new AscfResumePosition(entry.ChunkIndex, entry.ChunkOffset, entry.RawOffset, IsComplete: false);
+            }
+        }
+
+        var lastEntry = _entries[^1];
+        return new AscfResumePosition(metadata.ChunkCount, lastEntry.NextEncodedOffset, metadata.RawSize, IsComplete: false);
+    }
+
     internal void ValidateForRandomAccess(AscfFileHeader fileHeader, long indexOffset)
     {
         if (_entries.Length != fileHeader.ChunkCount)
@@ -86,29 +126,10 @@ public sealed class AscfChunkIndex
         for (var i = 0; i < _entries.Length; i++)
         {
             var entry = _entries[i];
-            var expectedRawLength = i == _entries.Length - 1
-                ? checked((int)(fileHeader.RawSize - expectedRawOffset))
-                : fileHeader.RawChunkSize;
-
-            if (entry.ChunkIndex != i
-                || entry.RawOffset != expectedRawOffset
-                || entry.ChunkOffset != expectedChunkOffset
-                || entry.RawLength != expectedRawLength)
-            {
-                throw new InvalidDataException(".ascf index entries do not match the file header.");
-            }
-
-            ValidateMethodForRandomAccess(entry);
-
-            var payloadOffset = CheckedAdd(entry.ChunkOffset, AscfFileFormat.ChunkHeaderSize);
-            var payloadEnd = CheckedAdd(payloadOffset, entry.StoredLength);
-            if (payloadEnd > indexOffset)
-            {
-                throw new InvalidDataException(".ascf index payload range overlaps the index.");
-            }
-
-            expectedRawOffset = CheckedAdd(expectedRawOffset, entry.RawLength);
-            expectedChunkOffset = CheckedAdd(expectedChunkOffset, (long)AscfFileFormat.ChunkHeaderSize + entry.StoredLength);
+            AscfChunkIndexValidation.ValidateEntryAgainstHeader(entry, fileHeader, indexOffset, i);
+            AscfChunkIndexValidation.ValidateChunkOffset(entry, expectedChunkOffset);
+            expectedRawOffset = AscfChunkIndexValidation.AddOffset(expectedRawOffset, entry.RawLength);
+            expectedChunkOffset = AscfChunkIndexValidation.GetNextEncodedOffset(entry);
         }
 
         if (expectedRawOffset != fileHeader.RawSize || expectedChunkOffset != indexOffset)
@@ -129,53 +150,15 @@ public sealed class AscfChunkIndex
                 || entry.Method > AscfFileFormat.MethodLz4HighCompression
                 || entry.RawLength <= 0
                 || entry.RawLength > AscfFileFormat.MaxRawChunkBytes
-                || entry.StoredLength <= 0
                 || entry.RawOffset != expectedRawOffset
                 || entry.ChunkOffset != expectedChunkOffset)
             {
                 throw new InvalidDataException(".ascf index entries are invalid.");
             }
 
-            expectedRawOffset = checked(expectedRawOffset + entry.RawLength);
-            expectedChunkOffset = checked(expectedChunkOffset + AscfFileFormat.ChunkHeaderSize + entry.StoredLength);
-        }
-    }
-
-    private static void ValidateMethodForRandomAccess(AscfChunkIndexEntry entry)
-    {
-        if (entry.Method == AscfFileFormat.MethodRaw)
-        {
-            if (entry.StoredLength != entry.RawLength)
-            {
-                throw new InvalidDataException(".ascf raw index entry has mismatched stored length.");
-            }
-
-            return;
-        }
-
-        if (entry.Method < AscfFileFormat.MethodRaw
-            || entry.Method > AscfFileFormat.MethodLz4HighCompression
-            || (AscfFileFormat.SupportedMethodMask & (1 << entry.Method)) == 0)
-        {
-            throw new InvalidDataException($".ascf index entry uses unsupported method {entry.Method}.");
-        }
-
-        var maxStoredLength = Lz4BlockCodec.MaxUsefulCompressedLength(entry.RawLength);
-        if (entry.StoredLength <= 0 || entry.StoredLength > maxStoredLength)
-        {
-            throw new InvalidDataException($".ascf compressed index entry length {entry.StoredLength} is invalid.");
-        }
-    }
-
-    private static long CheckedAdd(long left, long right)
-    {
-        try
-        {
-            return checked(left + right);
-        }
-        catch (OverflowException exception)
-        {
-            throw new InvalidDataException(".ascf index offsets overflow.", exception);
+            AscfChunkIndexValidation.ValidateEntryStorage(entry);
+            expectedRawOffset = AscfChunkIndexValidation.AddOffset(expectedRawOffset, entry.RawLength);
+            expectedChunkOffset = AscfChunkIndexValidation.GetNextEncodedOffset(entry);
         }
     }
 }
@@ -194,4 +177,7 @@ public readonly record struct AscfChunkIndexEntry(
 {
     /// <summary> The encoded offset of the payload bytes. </summary>
     public long PayloadOffset => checked(ChunkOffset + AscfFileFormat.ChunkHeaderSize);
+
+    /// <summary> the encoded offset after this chunk record. </summary>
+    public long NextEncodedOffset => checked(PayloadOffset + StoredLength);
 }

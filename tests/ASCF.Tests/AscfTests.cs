@@ -5,6 +5,7 @@ using Blake3;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace ASCF.Tests;
 
@@ -107,6 +108,150 @@ public sealed class AscfTests : IDisposable
 
         Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), hashes.Sha1);
         Assert.Equal(ComputeBlake3Hex(raw), hashes.Blake3);
+    }
+
+    [Fact]
+    public async Task WriteFileCanUseExplicitStreamId()
+    {
+        var raw = CreateMixedPayload(512 * 1024 + 91);
+        var sourcePath = WriteSource(raw);
+        var firstPath = Path.Combine(_testDirectory, "stream-id-first.ascf");
+        var secondPath = Path.Combine(_testDirectory, "stream-id-second.ascf");
+        var differentPath = Path.Combine(_testDirectory, "stream-id-different.ascf");
+        var streamId = Guid.Parse("dcb9e6ad-21fb-4a54-8de9-d2f2f237e870");
+        var options = AscfWriterOptions.Default with
+        {
+            StreamId = streamId
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, firstPath, options, CancellationToken.None);
+        await AscfFileWriter.WriteFileAsync(sourcePath, secondPath, options, CancellationToken.None);
+        await AscfFileWriter.WriteFileAsync(
+            sourcePath,
+            differentPath,
+            options with { StreamId = Guid.Parse("e0efa483-c6cc-493d-a748-e181ee14e07d") },
+            CancellationToken.None);
+
+        Assert.Equal(await File.ReadAllBytesAsync(firstPath), await File.ReadAllBytesAsync(secondPath));
+        Assert.NotEqual(await File.ReadAllBytesAsync(firstPath), await File.ReadAllBytesAsync(differentPath));
+    }
+
+    [Fact]
+    public async Task ReadMetadataReturnsHeaderFields()
+    {
+        var raw = CreateMixedPayload(192 * 1024 + 31);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "metadata.ascf");
+        var streamId = Guid.Parse("04ed6fd0-0ab8-4264-b12a-d0761a2d36e3");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = 64 * 1024,
+            RawHashAlgorithms = AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3,
+            StreamId = streamId
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, options, CancellationToken.None);
+        var metadata = AscfFileReader.ReadMetadata(ascfPath);
+
+        Assert.Equal(raw.Length, metadata.RawSize);
+        Assert.Equal(new FileInfo(ascfPath).Length, metadata.EncodedSize);
+        Assert.Equal(options.RawChunkSize, metadata.RawChunkSize);
+        Assert.Equal(AscfFileFormat.GetChunkCount(raw.Length, options.RawChunkSize), metadata.ChunkCount);
+        Assert.Equal(streamId, metadata.StreamId);
+        Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), metadata.StoredHashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(ComputeBlake3Hex(raw), metadata.StoredHashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+    }
+
+    [Fact]
+    public async Task ReadResumeInfoUsesCompleteChunkBoundaries()
+    {
+        var raw = CreateMixedPayload((3 * 64 * 1024) + 37);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "resume-info.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = 64 * 1024
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, options, CancellationToken.None);
+        var metadata = AscfFileReader.ReadMetadata(ascfPath);
+        var index = AscfFileReader.ReadChunkIndex(ascfPath);
+        var firstChunkEnd = index[0].NextEncodedOffset;
+        var lastEntry = index[index.Entries.Count - 1];
+        var chunkDataEnd = lastEntry.NextEncodedOffset;
+
+        var beforeHeader = await AscfFileReader.ReadResumeInfoAsync(ascfPath, AscfFileFormat.HeaderSize - 1, CancellationToken.None);
+        var insideFirstChunk = await AscfFileReader.ReadResumeInfoAsync(ascfPath, index[0].PayloadOffset, CancellationToken.None);
+        var afterFirstChunk = await AscfFileReader.ReadResumeInfoAsync(ascfPath, firstChunkEnd, CancellationToken.None);
+        var insideIndex = await AscfFileReader.ReadResumeInfoAsync(ascfPath, metadata.EncodedSize - 1, CancellationToken.None);
+        var complete = await AscfFileReader.ReadResumeInfoAsync(ascfPath, metadata.EncodedSize, CancellationToken.None);
+
+        Assert.False(beforeHeader.Position.CanResume);
+        Assert.Equal(0, beforeHeader.Position.NextEncodedOffset);
+        Assert.True(insideFirstChunk.Position.CanResume);
+        Assert.Equal(0, insideFirstChunk.Position.NextChunkIndex);
+        Assert.Equal(AscfFileFormat.HeaderSize, insideFirstChunk.Position.NextEncodedOffset);
+        Assert.True(afterFirstChunk.Position.CanResume);
+        Assert.Equal(1, afterFirstChunk.Position.NextChunkIndex);
+        Assert.Equal(firstChunkEnd, afterFirstChunk.Position.NextEncodedOffset);
+        Assert.Equal(index[1].RawOffset, afterFirstChunk.Position.NextRawOffset);
+        Assert.True(insideIndex.Position.CanResume);
+        Assert.Equal(metadata.ChunkCount, insideIndex.Position.NextChunkIndex);
+        Assert.Equal(chunkDataEnd, insideIndex.Position.NextEncodedOffset);
+        Assert.Equal(metadata.RawSize, insideIndex.Position.NextRawOffset);
+        Assert.True(complete.Position.IsComplete);
+        Assert.False(complete.Position.CanResume);
+        Assert.Equal(metadata.EncodedSize, complete.Position.NextEncodedOffset);
+    }
+
+    [Fact]
+    public async Task ReadResumeInfoMatchesIndexForLargeFiles()
+    {
+        var raw = CreateIncompressiblePayload((530 * AscfFileFormat.MinRawChunkBytes) + 123);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "resume-info-large.ascf");
+        var options = AscfWriterOptions.Default with
+        {
+            RawChunkSize = AscfFileFormat.MinRawChunkBytes
+        };
+
+        await AscfFileWriter.WriteStoredRawFileAsync(sourcePath, 0, raw.Length, ascfPath, options, CancellationToken.None);
+        var metadata = AscfFileReader.ReadMetadata(ascfPath);
+        var index = AscfFileReader.ReadChunkIndex(ascfPath);
+        var middle = index.Entries.Count / 2;
+        var probes = new[]
+        {
+            index[0].PayloadOffset,
+            index[middle].PayloadOffset + 1,
+            index[middle].NextEncodedOffset,
+            metadata.EncodedSize - 1
+        };
+
+        Assert.True(metadata.ChunkCount > 512);
+        foreach (var encodedBytes in probes)
+        {
+            var expected = index.GetResumePosition(encodedBytes, metadata);
+            var actual = await AscfFileReader.ReadResumeInfoAsync(ascfPath, encodedBytes, CancellationToken.None);
+
+            Assert.Equal(metadata, actual.Metadata);
+            Assert.Equal(expected, actual.Position);
+        }
+    }
+
+    [Fact]
+    public void DeterministicStreamIdsUseSeedBytes()
+    {
+        var firstSeed = Encoding.ASCII.GetBytes("stream-id:one");
+        var secondSeed = Encoding.ASCII.GetBytes("stream-id:two");
+
+        var first = AscfStreamIds.CreateDeterministic(firstSeed);
+        var same = AscfStreamIds.CreateDeterministic(firstSeed);
+        var different = AscfStreamIds.CreateDeterministic(secondSeed);
+        var fromString = AscfStreamIds.CreateDeterministic("stream-id:one");
+
+        Assert.Equal(first, same);
+        Assert.Equal(first, fromString);
+        Assert.NotEqual(first, different);
     }
 
     [Fact]
@@ -250,6 +395,59 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task CopyEncodedStreamToFileReturnsStoredHeaderHashes()
+    {
+        var raw = CreateMixedPayload(256 * 1024 + 67);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "copy-stored-hashes-source.ascf");
+        var copiedPath = Path.Combine(_testDirectory, "copy-stored-hashes.ascf");
+        var writeOptions = AscfWriterOptions.Default with
+        {
+            RawHashAlgorithms = AscfRawHashAlgorithms.Sha1
+        };
+        var readOptions = AscfReaderOptions.Default with
+        {
+            ResultHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, writeOptions, CancellationToken.None);
+        await using var encodedStream = File.OpenRead(ascfPath);
+        var result = await AscfFileReader.CopyEncodedStreamToFileAsync(encodedStream, copiedPath, transform: null, readOptions, CancellationToken.None);
+        var storedHashes = AscfFileReader.ReadRawHashes(copiedPath);
+        var expectedSha1 = Convert.ToHexString(SHA1.HashData(raw));
+        var expectedBlake3 = ComputeBlake3Hex(raw);
+
+        Assert.Equal(expectedBlake3, result.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(expectedSha1, result.StoredHashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, result.StoredHashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(result.StoredHashes, storedHashes);
+    }
+
+    [Fact]
+    public async Task ReaderCanRequireStoredHeaderHash()
+    {
+        var raw = CreateMixedPayload(128 * 1024 + 17);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "required-stored-hash-source.ascf");
+        var copiedPath = Path.Combine(_testDirectory, "required-stored-hash-copy.ascf");
+        var writeOptions = AscfWriterOptions.Default with
+        {
+            RawHashAlgorithms = AscfRawHashAlgorithms.Sha1
+        };
+        var readOptions = AscfReaderOptions.Default with
+        {
+            ResultHashAlgorithms = AscfRawHashAlgorithms.Blake3,
+            RequiredStoredHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, writeOptions, CancellationToken.None);
+        await using var encodedStream = File.OpenRead(ascfPath);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            AscfFileReader.CopyEncodedStreamToFileAsync(encodedStream, copiedPath, transform: null, readOptions, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RejectMismatchedStoredRawSha1WhenHashing()
     {
         var raw = CreateMixedPayload(256 * 1024 + 19);
@@ -303,6 +501,7 @@ public sealed class AscfTests : IDisposable
 
         Assert.Equal(raw.Length, progressed);
         Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), result.Hashes.Sha1);
+        Assert.Equal(result.Hashes.Sha1, result.StoredHashes.Sha1);
         Assert.Equal(raw.Length, result.RawSize);
         Assert.Equal(raw, decoded);
     }
@@ -519,16 +718,39 @@ public sealed class AscfTests : IDisposable
         var raw = CreateMixedPayload(768 * 1024 + 31);
         var sourcePath = WriteSource(raw);
         var wrappedPath = Path.Combine(_testDirectory, "source.llz4");
-        var rawTempPath = Path.Combine(_testDirectory, "temp.raw");
         var ascfPath = Path.Combine(_testDirectory, "source.ascf");
         var wrappedAgainPath = Path.Combine(_testDirectory, "again.llz4");
 
         await WrappedLz4FileFormat.WriteFromRawFileAsync(sourcePath, wrappedPath, CancellationToken.None);
-        await FileFormatTranscoder.ConvertWrappedLz4ToAscfAsync(wrappedPath, rawTempPath, ascfPath, CancellationToken.None);
-        await FileFormatTranscoder.ConvertAscfFileToWrappedLz4Async(ascfPath, rawTempPath, wrappedAgainPath, CancellationToken.None);
+        await FileFormatTranscoder.ConvertWrappedLz4ToAscfAsync(wrappedPath, ascfPath, CancellationToken.None);
+        await FileFormatTranscoder.ConvertAscfFileToWrappedLz4Async(ascfPath, wrappedAgainPath, CancellationToken.None);
 
         Assert.Equal(raw, AscfFileReader.DecodeToArray(await File.ReadAllBytesAsync(ascfPath)));
         Assert.Equal(raw, WrappedLz4FileFormat.DecodeToArray(await File.ReadAllBytesAsync(wrappedAgainPath)));
+        Assert.Empty(Directory.EnumerateFiles(_testDirectory, "*.raw.tmp"));
+    }
+
+    [Fact]
+    public async Task TranscodeHashResultExposesRequiredHashes()
+    {
+        var raw = CreateMixedPayload(512 * 1024 + 19);
+        var sourcePath = WriteSource(raw);
+        var wrappedPath = Path.Combine(_testDirectory, "hash-source.llz4");
+        var ascfPath = Path.Combine(_testDirectory, "hash-source.ascf");
+        var options = FileFormatTranscodeOptions.Default with
+        {
+            AscfWriter = AscfWriterOptions.Default with
+            {
+                RawHashAlgorithms = AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3,
+                ResultHashAlgorithms = AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3
+            }
+        };
+
+        await WrappedLz4FileFormat.WriteFromRawFileAsync(sourcePath, wrappedPath, CancellationToken.None);
+        var result = await FileFormatTranscoder.ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, ascfPath, options, CancellationToken.None);
+
+        Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), result.Sha1Hash);
+        Assert.Equal(ComputeBlake3Hex(raw), result.Blake3Hash);
     }
 
     [Fact]

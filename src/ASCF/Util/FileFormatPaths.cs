@@ -5,21 +5,26 @@ internal static class FileFormatPaths
     public static StagedFile CreateStagedFile(string outputPath)
         => new(outputPath, CreateStagingPath(outputPath));
 
-    public static FileStream OpenSequentialStagingWrite(string stagingPath, int bufferSize, long preallocationSize = 0)
-        => OpenStagingWrite(
-            stagingPath,
-            FileAccess.Write,
-            bufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan,
-            preallocationSize);
+    public static string CreateSiblingTempPath(string outputPath, string extension)
+    {
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            throw new ArgumentException("Temp file extension must not be empty.", nameof(extension));
+        }
 
-    public static FileStream OpenRandomStagingReadWrite(string stagingPath, int bufferSize, long preallocationSize = 0)
-        => OpenStagingWrite(
-            stagingPath,
-            FileAccess.ReadWrite,
-            bufferSize,
-            FileOptions.Asynchronous | FileOptions.RandomAccess,
-            preallocationSize);
+        EnsureOutputDirectory(outputPath);
+
+        var fullPath = Path.GetFullPath(outputPath);
+        var directory = Path.GetDirectoryName(fullPath);
+        var fileName = Path.GetFileName(fullPath);
+        if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
+        {
+            throw new ArgumentException("Output path must include a file name.", nameof(outputPath));
+        }
+
+        var normalizedExtension = extension.StartsWith('.') ? extension : "." + extension;
+        return Path.Combine(directory, $".{fileName}.{Guid.NewGuid():N}{normalizedExtension}");
+    }
 
     public static void EnsureOutputDirectory(string outputPath)
     {
@@ -31,32 +36,15 @@ internal static class FileFormatPaths
     }
 
     private static string CreateStagingPath(string outputPath)
-    {
-        EnsureOutputDirectory(outputPath);
-
-        var fullPath = Path.GetFullPath(outputPath);
-        var directory = Path.GetDirectoryName(fullPath);
-        var fileName = Path.GetFileName(fullPath);
-        if (string.IsNullOrEmpty(directory) || string.IsNullOrEmpty(fileName))
-        {
-            throw new ArgumentException("Output path must include a file name.", nameof(outputPath));
-        }
-
-        return Path.Combine(directory, $".{fileName}.{Guid.NewGuid():N}.tmp");
-    }
+        => CreateSiblingTempPath(outputPath, ".tmp");
 
     private static FileStream OpenStagingWrite(
         string stagingPath,
         FileAccess access,
         int bufferSize,
-        FileOptions options,
-        long preallocationSize)
+        FileOptions options)
     {
         FileFormatBuffers.ValidateBufferSize(bufferSize, nameof(bufferSize));
-        if (preallocationSize < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(preallocationSize), preallocationSize, "Preallocation size must be non-negative.");
-        }
 
         return new FileStream(
             stagingPath,
@@ -66,8 +54,7 @@ internal static class FileFormatPaths
                 Access = access,
                 Share = FileShare.None,
                 BufferSize = bufferSize,
-                Options = options,
-                PreallocationSize = preallocationSize
+                Options = options
             });
     }
 
@@ -83,7 +70,7 @@ internal static class FileFormatPaths
         File.Move(stagingPath, fullPath);
     }
 
-    private static void TryDeleteFile(string path)
+    public static void TryDeleteFile(string path)
     {
         try
         {
@@ -106,7 +93,21 @@ internal static class FileFormatPaths
             StagingPath = path;
         }
 
-        public string StagingPath { get; }
+        private string StagingPath { get; }
+
+        public FileStream OpenSequentialWrite(int bufferSize)
+            => OpenStagingWrite(
+                StagingPath,
+                FileAccess.Write,
+                bufferSize,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+        public FileStream OpenRandomReadWrite(int bufferSize)
+            => OpenStagingWrite(
+                StagingPath,
+                FileAccess.ReadWrite,
+                bufferSize,
+                FileOptions.Asynchronous | FileOptions.RandomAccess);
 
         public void Commit()
         {
