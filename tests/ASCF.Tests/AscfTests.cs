@@ -395,6 +395,37 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task DecodeToArrayWithHashCanReturnAndValidateRawHashes()
+    {
+        var raw = CreateMixedPayload(128 * 1024 + 79);
+        var sourcePath = WriteSource(raw);
+        var ascfPath = Path.Combine(_testDirectory, "array-hash.ascf");
+        var writeOptions = AscfWriterOptions.Default with
+        {
+            RawHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+        var readOptions = AscfReaderOptions.Default with
+        {
+            ResultHashAlgorithms = AscfRawHashAlgorithms.Sha1,
+            RequiredStoredHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+
+        await AscfFileWriter.WriteFileAsync(sourcePath, ascfPath, writeOptions, CancellationToken.None);
+        var encoded = await File.ReadAllBytesAsync(ascfPath);
+        var decoded = AscfFileReader.DecodeToArrayWithHash(encoded, readOptions);
+        var expectedSha1 = Convert.ToHexString(SHA1.HashData(raw));
+
+        Assert.Equal(raw, decoded.Raw);
+        Assert.Equal(raw.LongLength, decoded.RawSize);
+        Assert.Equal(expectedSha1, decoded.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+
+        encoded[0x70] ^= 0x5A;
+        RecomputeFileHeaderChecksum(encoded);
+
+        Assert.Throws<InvalidDataException>(() => AscfFileReader.DecodeToArrayWithHash(encoded, readOptions));
+    }
+
+    [Fact]
     public async Task CopyEncodedStreamToFileReturnsStoredHeaderHashes()
     {
         var raw = CreateMixedPayload(256 * 1024 + 67);

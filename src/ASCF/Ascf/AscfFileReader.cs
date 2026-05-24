@@ -9,6 +9,7 @@ namespace ASCF;
 public static class AscfFileReader
 {
     public readonly record struct DecodeResult(AscfRawHashes Hashes, long RawSize);
+    public readonly record struct DecodedArrayResult(byte[] Raw, AscfRawHashes Hashes, long RawSize);
     public readonly record struct StoredStreamResult(AscfRawHashes Hashes, AscfRawHashes StoredHashes, long RawSize, long StoredSize);
 
     private readonly record struct DecodeFileResult(AscfRawHashes Hashes, long RawSize, bool HasHashes);
@@ -250,15 +251,8 @@ public static class AscfFileReader
     {
         options.Validate();
         var fileHeader = ValidateHeader(encoded, options, encoded.Length);
-        if (fileHeader.RawSize > options.MaxInMemoryDecodeBytes || fileHeader.RawSize > int.MaxValue)
-        {
-            throw new InvalidDataException($".ascf raw size is too large for an in-memory decode ({fileHeader.RawSize} bytes).");
-        }
-
-        var raw = fileHeader.RawSize == 0
-            ? []
-            : GC.AllocateUninitializedArray<byte>(checked((int)fileHeader.RawSize));
-        DecodeToArray(encoded, raw, fileHeader);
+        var raw = AllocateInMemoryDecodeBuffer(fileHeader, options);
+        DecodeToArray(encoded, raw, fileHeader, hasher: null);
         return raw;
     }
 
@@ -267,6 +261,25 @@ public static class AscfFileReader
 
     public static byte[] DecodeToArray(byte[] encoded, AscfReaderOptions options)
         => DecodeToArray(encoded.AsSpan(), options);
+
+    public static DecodedArrayResult DecodeToArrayWithHash(ReadOnlySpan<byte> encoded)
+        => DecodeToArrayWithHash(encoded, AscfReaderOptions.Default);
+
+    public static DecodedArrayResult DecodeToArrayWithHash(ReadOnlySpan<byte> encoded, AscfReaderOptions options)
+    {
+        ValidateHashResultOptions(options);
+        var fileHeader = ValidateHeader(encoded, options, encoded.Length);
+        var raw = AllocateInMemoryDecodeBuffer(fileHeader, options);
+        using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
+        var hashes = DecodeToArray(encoded, raw, fileHeader, hasher);
+        return new DecodedArrayResult(raw, GetResultHashes(hashes, options), fileHeader.RawSize);
+    }
+
+    public static DecodedArrayResult DecodeToArrayWithHash(byte[] encoded)
+        => DecodeToArrayWithHash(encoded.AsSpan(), AscfReaderOptions.Default);
+
+    public static DecodedArrayResult DecodeToArrayWithHash(byte[] encoded, AscfReaderOptions options)
+        => DecodeToArrayWithHash(encoded.AsSpan(), options);
 
     public static DecodeResult ComputeFileHash(string inputPath)
         => ComputeFileHash(inputPath, AscfReaderOptions.Default);
@@ -957,7 +970,23 @@ public static class AscfFileReader
         return new DecodedChunkResult(rawSize, encodedOffset, entries);
     }
 
-    private static void DecodeToArray(ReadOnlySpan<byte> encoded, byte[] raw, AscfFileHeader fileHeader)
+    private static byte[] AllocateInMemoryDecodeBuffer(AscfFileHeader fileHeader, AscfReaderOptions options)
+    {
+        if (fileHeader.RawSize > options.MaxInMemoryDecodeBytes || fileHeader.RawSize > int.MaxValue)
+        {
+            throw new InvalidDataException($".ascf raw size is too large for an in-memory decode ({fileHeader.RawSize} bytes).");
+        }
+
+        return fileHeader.RawSize == 0
+            ? []
+            : GC.AllocateUninitializedArray<byte>(checked((int)fileHeader.RawSize));
+    }
+
+    private static AscfRawHashBytes DecodeToArray(
+        ReadOnlySpan<byte> encoded,
+        byte[] raw,
+        AscfFileHeader fileHeader,
+        AscfRawContentHasher? hasher)
     {
         var entries = new List<AscfChunkIndexEntry>(fileHeader.ChunkCount);
         long rawSize = 0;
@@ -981,6 +1010,7 @@ public static class AscfFileReader
                 ValidateRawChecksum(chunk, destination);
             }
 
+            hasher?.AppendData(destination);
             entries.Add(ToIndexEntry(chunk, encodedOffset));
             rawSize += chunk.RawLength;
             encodedOffset += AscfFileFormat.ChunkHeaderSize + chunk.StoredLength;
@@ -996,6 +1026,8 @@ public static class AscfFileReader
         {
             throw new InvalidDataException(".ascf stream contained trailing bytes.");
         }
+
+        return hasher is null ? default : FinalizeHashes(fileHeader, hasher);
     }
 
     private static AscfFileHeader ValidateHeader(ReadOnlySpan<byte> header, AscfReaderOptions options, long? encodedLength)
