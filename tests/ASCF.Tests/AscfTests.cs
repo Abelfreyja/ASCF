@@ -1027,6 +1027,17 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task WrappedLz4StreamExtractAppliesTransform()
+    {
+        await VerifyWrappedLz4StreamExtractAsync(CreateRepeatingPayload(256 * 1024 + 17), expectStoredRaw: false);
+        await VerifyWrappedLz4StreamExtractAsync(
+            CreateRepeatingPayload(256 * 1024 + 23),
+            expectStoredRaw: false,
+            Lz4FormatOptions.Default with { MemoryMappedDecodeThreshold = 0 });
+        await VerifyWrappedLz4StreamExtractAsync(CreateIncompressiblePayload(256 * 1024 + 19), expectStoredRaw: true);
+    }
+
+    [Fact]
     public async Task RejectInvalidStoredRawSourceRange()
     {
         var raw = CreateMixedPayload(1024);
@@ -1393,6 +1404,39 @@ public sealed class AscfTests : IDisposable
             return await AscfFileReader.DecodeStreamToFileAsync(input, outputPath, CancellationToken.None)
                 .ConfigureAwait(false);
         }
+    }
+
+    private async Task VerifyWrappedLz4StreamExtractAsync(byte[] raw, bool expectStoredRaw, Lz4FormatOptions? options = null)
+    {
+        var sourcePath = WriteSource(raw);
+        var wrappedPath = Path.Combine(_testDirectory, $"{Guid.NewGuid():N}.llz4");
+        var outputPath = Path.Combine(_testDirectory, $"{Guid.NewGuid():N}.raw");
+        byte[] sentinel = [0xAC, 0xCF, 0x42];
+        AscfBufferTransform transform = static buffer =>
+        {
+            foreach (ref var value in buffer)
+            {
+                value ^= 0x5A;
+            }
+        };
+
+        await WrappedLz4FileFormat.WriteFromRawFileAsync(sourcePath, wrappedPath, CancellationToken.None).ConfigureAwait(false);
+        var encoded = await File.ReadAllBytesAsync(wrappedPath).ConfigureAwait(false);
+        var header = WrappedLz4FileFormat.ReadHeader(encoded.Length, encoded);
+        var transformed = encoded.ToArray();
+        transform(transformed);
+        using var stream = new MemoryStream(transformed.Concat(sentinel).ToArray());
+
+        var rawSize = await WrappedLz4FileFormat
+            .ExtractStreamToRawFileAsync(stream, encoded.Length, outputPath, transform, options ?? Lz4FormatOptions.Default, CancellationToken.None)
+            .ConfigureAwait(false);
+
+        Assert.Equal(expectStoredRaw, header.InputLength == header.OutputLength);
+        Assert.Equal(raw.Length, rawSize);
+        Assert.Equal(encoded.Length, stream.Position);
+        Assert.Equal(sentinel, stream.ToArray().AsSpan(encoded.Length).ToArray());
+        Assert.Equal(raw, await File.ReadAllBytesAsync(outputPath).ConfigureAwait(false));
+        AssertNoStagingFiles(outputPath);
     }
 
     private static byte[] CreateMixedPayload(int length)

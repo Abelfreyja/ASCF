@@ -1,4 +1,5 @@
 using System.Buffers;
+using ASCF;
 
 namespace ASCF.Util;
 
@@ -38,7 +39,16 @@ internal static class FileFormatStreamReader
         return offset;
     }
 
-    public static async Task CopyExactlyAsync(Stream source, Stream destination, long bytesToCopy, int bufferSize, CancellationToken token)
+    public static Task CopyExactlyAsync(Stream source, Stream destination, long bytesToCopy, int bufferSize, CancellationToken token)
+        => CopyExactlyAsync(source, destination, bytesToCopy, bufferSize, transform: null, token);
+
+    public static async Task CopyExactlyAsync(
+        Stream source,
+        Stream destination,
+        long bytesToCopy,
+        int bufferSize,
+        AscfBufferTransform? transform,
+        CancellationToken token)
     {
         if (bytesToCopy <= 0)
         {
@@ -46,11 +56,10 @@ internal static class FileFormatStreamReader
         }
 
         FileFormatBuffers.ValidateBufferSize(bufferSize, nameof(bufferSize));
-
         var buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
         try
         {
-            await CopyExactlyAsync(source, destination, bytesToCopy, buffer, token).ConfigureAwait(false);
+            await CopyExactlyAsync(source, destination, bytesToCopy, buffer, transform, token).ConfigureAwait(false);
         }
         finally
         {
@@ -58,7 +67,16 @@ internal static class FileFormatStreamReader
         }
     }
 
-    public static async Task CopyExactlyAsync(Stream source, Stream destination, long bytesToCopy, byte[] buffer, CancellationToken token)
+    public static Task CopyExactlyAsync(Stream source, Stream destination, long bytesToCopy, byte[] buffer, CancellationToken token)
+        => CopyExactlyAsync(source, destination, bytesToCopy, buffer, transform: null, token);
+
+    private static async Task CopyExactlyAsync(
+        Stream source,
+        Stream destination,
+        long bytesToCopy,
+        byte[] buffer,
+        AscfBufferTransform? transform,
+        CancellationToken token)
     {
         if (bytesToCopy <= 0)
         {
@@ -79,6 +97,7 @@ internal static class FileFormatStreamReader
                 throw new EndOfStreamException();
             }
 
+            transform?.Invoke(buffer.AsSpan(0, read));
             await destination.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
             remaining -= read;
         }

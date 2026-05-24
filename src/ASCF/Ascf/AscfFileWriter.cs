@@ -147,13 +147,7 @@ public static class AscfFileWriter
         var sourceInfo = new FileInfo(sourcePath);
         ValidateRawSize(sourceInfo.Length, options.Format.MaxRawFileBytes);
 
-        var source = new FileStream(
-            sourcePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.Format.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var source = FileFormatStreams.OpenSequentialReadAsync(sourcePath, options.Format.BufferSize);
         await using (source.ConfigureAwait(false))
         {
             using var hasher = CreateRawHasher(options.Format.RawHashAlgorithms | requiredHashAlgorithms);
@@ -297,13 +291,7 @@ public static class AscfFileWriter
         ValidateSourceRange(sourceOffset, rawLength, sourceInfo.Length);
 
         (long RawSize, long StoredSize, AscfRawHashBytes RawHashes) result;
-        var source = new FileStream(
-            sourcePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var source = FileFormatStreams.OpenSequentialReadAsync(sourcePath, options.BufferSize);
         await using (source.ConfigureAwait(false))
         {
             source.Position = sourceOffset;

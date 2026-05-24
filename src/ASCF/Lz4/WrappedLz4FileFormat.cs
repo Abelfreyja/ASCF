@@ -87,35 +87,83 @@ public static class WrappedLz4FileFormat
     public static async Task<long> ExtractToRawFileAsync(string wrappedPath, string outputPath, Lz4FormatOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, options.BufferSize, useAsync: true);
+        var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var header = new byte[HeaderSize];
             await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
 
-            var outputLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-            var inputLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
-            ValidateHeader(input.Length, outputLength, inputLength, options.MaxRawFileBytes);
+            var wrappedHeader = ReadHeader(input.Length, header, options);
 
             using var staged = FileFormatPaths.CreateStagedFile(outputPath);
-            if (outputLength == 0)
+            if (CanDecodeStreamPayloadDirectly(wrappedHeader, options))
             {
-                await CreateEmptyFileAsync(staged, options, token).ConfigureAwait(false);
-                staged.Commit();
-                return 0;
+                await ExtractDirectPayloadToStagedFileAsync(input, staged, wrappedHeader, transform: null, options, token)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await DecodeMemoryMappedCompressedPayloadToRawFileAsync(
+                        wrappedPath,
+                        staged,
+                        wrappedHeader.InputLength,
+                        wrappedHeader.OutputLength,
+                        options,
+                        token)
+                    .ConfigureAwait(false);
             }
 
-            if (inputLength == outputLength)
-            {
-                await CopyStoredRawPayloadAsync(input, staged, inputLength, options, token).ConfigureAwait(false);
-                staged.Commit();
-                return outputLength;
-            }
-
-            await DecodeCompressedPayloadToRawFileAsync(input, wrappedPath, staged, inputLength, outputLength, options, token).ConfigureAwait(false);
             staged.Commit();
-            return outputLength;
+            return wrappedHeader.OutputLength;
         }
+    }
+
+    public static Task<long> ExtractStreamToRawFileAsync(
+        Stream wrappedStream,
+        long wrappedLength,
+        string outputPath,
+        CancellationToken token)
+        => ExtractStreamToRawFileAsync(wrappedStream, wrappedLength, outputPath, transform: null, Lz4FormatOptions.Default, token);
+
+    public static Task<long> ExtractStreamToRawFileAsync(
+        Stream wrappedStream,
+        long wrappedLength,
+        string outputPath,
+        AscfBufferTransform? transform,
+        CancellationToken token)
+        => ExtractStreamToRawFileAsync(wrappedStream, wrappedLength, outputPath, transform, Lz4FormatOptions.Default, token);
+
+    public static async Task<long> ExtractStreamToRawFileAsync(
+        Stream wrappedStream,
+        long wrappedLength,
+        string outputPath,
+        AscfBufferTransform? transform,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        ArgumentOutOfRangeException.ThrowIfNegative(wrappedLength);
+        if (wrappedLength < HeaderSize)
+        {
+            throw new InvalidDataException("Wrapped LZ4 stream is too short.");
+        }
+
+        var headerBytes = new byte[HeaderSize];
+        await wrappedStream.ReadExactlyAsync(headerBytes.AsMemory(0, headerBytes.Length), token).ConfigureAwait(false);
+        transform?.Invoke(headerBytes);
+
+        var header = ReadHeader(wrappedLength, headerBytes, options);
+        if (!CanDecodeStreamPayloadDirectly(header, options))
+        {
+            return await ExtractStreamViaTempFileAsync(wrappedStream, wrappedLength, headerBytes, outputPath, transform, options, token)
+                .ConfigureAwait(false);
+        }
+
+        using var staged = FileFormatPaths.CreateStagedFile(outputPath);
+        await ExtractDirectPayloadToStagedFileAsync(wrappedStream, staged, header, transform, options, token)
+            .ConfigureAwait(false);
+        staged.Commit();
+        return header.OutputLength;
     }
 
     public static Task<long> DecodeFileToFileAsync(string inputPath, string outputPath, CancellationToken token)
@@ -230,7 +278,7 @@ public static class WrappedLz4FileFormat
             return null;
         }
 
-        var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, useAsync: true);
+        var input = FileFormatStreams.OpenReadAsync(path, bufferSize);
         await using (input.ConfigureAwait(false))
         {
             var header = new byte[HeaderSize];
@@ -251,7 +299,7 @@ public static class WrappedLz4FileFormat
             return null;
         }
 
-        using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(path, bufferSize);
         var header = new byte[HeaderSize];
         var read = FileFormatStreamReader.ReadUpTo(input, header);
         return read == header.Length ? TryReadHeader(fileLength, header, options) : null;
@@ -287,7 +335,7 @@ public static class WrappedLz4FileFormat
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
         AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
 
-        var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
+        var input = FileFormatStreams.OpenReadAsync(wrappedPath, streamBufferSize);
         await using (input.ConfigureAwait(false))
         {
             input.Position = HeaderSize;
@@ -341,7 +389,7 @@ public static class WrappedLz4FileFormat
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
         AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
 
-        using var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(wrappedPath, streamBufferSize);
         input.Position = HeaderSize;
 
         using var hasher = AscfRawContentHasher.Create(algorithms);
@@ -419,36 +467,59 @@ public static class WrappedLz4FileFormat
         await emptyStream.DisposeAsync().ConfigureAwait(false);
     }
 
+    private static Task CopyStoredRawPayloadAsync(
+        Stream input,
+        FileFormatPaths.StagedFile output,
+        int inputLength,
+        Lz4FormatOptions options,
+        CancellationToken token)
+        => CopyStoredRawPayloadAsync(input, output, inputLength, transform: null, options, token);
+
     private static async Task CopyStoredRawPayloadAsync(
         Stream input,
         FileFormatPaths.StagedFile output,
         int inputLength,
+        AscfBufferTransform? transform,
         Lz4FormatOptions options,
         CancellationToken token)
     {
         var outputStream = output.OpenSequentialWrite(options.BufferSize);
         await using (outputStream.ConfigureAwait(false))
         {
-            await FileFormatStreamReader.CopyExactlyAsync(input, outputStream, inputLength, options.CopyBufferSize, token).ConfigureAwait(false);
+            await FileFormatStreamReader
+                .CopyExactlyAsync(input, outputStream, inputLength, options.CopyBufferSize, transform, token)
+                .ConfigureAwait(false);
         }
     }
 
-    private static async Task DecodeCompressedPayloadToRawFileAsync(
+    private static async Task ExtractDirectPayloadToStagedFileAsync(
         Stream input,
-        string wrappedPath,
         FileFormatPaths.StagedFile output,
-        int inputLength,
-        int outputLength,
+        Header header,
+        AscfBufferTransform? transform,
         Lz4FormatOptions options,
         CancellationToken token)
     {
-        if (outputLength < options.MemoryMappedDecodeThreshold)
+        if (header.OutputLength == 0)
         {
-            await DecodeSmallCompressedPayloadToRawFileAsync(input, output, inputLength, outputLength, options, token).ConfigureAwait(false);
+            await CreateEmptyFileAsync(output, options, token).ConfigureAwait(false);
             return;
         }
 
-        await DecodeMemoryMappedCompressedPayloadToRawFileAsync(wrappedPath, output, inputLength, outputLength, options, token)
+        if (Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength))
+        {
+            await CopyStoredRawPayloadAsync(input, output, header.InputLength, transform, options, token).ConfigureAwait(false);
+            return;
+        }
+
+        await DecodeSmallCompressedPayloadToRawFileAsync(
+                input,
+                output,
+                header.InputLength,
+                header.OutputLength,
+                transform,
+                options,
+                token)
             .ConfigureAwait(false);
     }
 
@@ -457,12 +528,14 @@ public static class WrappedLz4FileFormat
         FileFormatPaths.StagedFile output,
         int inputLength,
         int outputLength,
+        AscfBufferTransform? transform,
         Lz4FormatOptions options,
         CancellationToken token)
     {
         var compressed = GC.AllocateUninitializedArray<byte>(inputLength);
         var raw = GC.AllocateUninitializedArray<byte>(outputLength);
         await input.ReadExactlyAsync(compressed.AsMemory(0, inputLength), token).ConfigureAwait(false);
+        transform?.Invoke(compressed.AsSpan(0, inputLength));
         Lz4BlockCodec.Decode(compressed, 0, inputLength, raw, 0, outputLength);
 
         var outputStream = output.OpenSequentialWrite(options.BufferSize);
@@ -525,6 +598,52 @@ public static class WrappedLz4FileFormat
         }
     }
 
+    private static bool CanDecodeStreamPayloadDirectly(Header header, Lz4FormatOptions options)
+        => Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength)
+            || (header.OutputLength <= options.MaxInMemoryDecodeBytes
+                && header.OutputLength < options.MemoryMappedDecodeThreshold);
+
+    private static async Task<long> ExtractStreamViaTempFileAsync(
+        Stream wrappedStream,
+        long wrappedLength,
+        byte[] headerBytes,
+        string outputPath,
+        AscfBufferTransform? transform,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        var tempPath = FileFormatPaths.CreateSiblingTempPath(outputPath, ".wrapped.tmp");
+        try
+        {
+            var temp = new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                options.BufferSize,
+                useAsync: true);
+            await using (temp.ConfigureAwait(false))
+            {
+                await temp.WriteAsync(headerBytes.AsMemory(0, headerBytes.Length), token).ConfigureAwait(false);
+                await FileFormatStreamReader
+                    .CopyExactlyAsync(
+                        wrappedStream,
+                        temp,
+                        wrappedLength - HeaderSize,
+                        options.CopyBufferSize,
+                        transform,
+                        token)
+                    .ConfigureAwait(false);
+            }
+
+            return await ExtractToRawFileAsync(tempPath, outputPath, options, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            FileFormatPaths.TryDeleteFile(tempPath);
+        }
+    }
+
     private static async Task<HashedWriteResult> WriteSmallFileAsync(
         string sourcePath,
         string outputPath,
@@ -576,7 +695,7 @@ public static class WrappedLz4FileFormat
     {
         token.ThrowIfCancellationRequested();
 
-        using var sourceStream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, options.BufferSize, FileOptions.SequentialScan);
+        using var sourceStream = FileFormatStreams.OpenSequentialRead(sourcePath, options.BufferSize);
         var rawLength = checked((int)sourceStream.Length);
         var storedLength = rawLength;
 
@@ -671,29 +790,5 @@ public static class WrappedLz4FileFormat
 
     private static FileFormatRawHashResult ToRawHashResult(AscfRawContentHasher? hasher, long rawSize)
         => new(FinalizeRawHashes(hasher), rawSize);
-
-    private static void ValidateHeader(long fileLength, int outputLength, int inputLength, long maxRawFileBytes)
-    {
-        if (outputLength < 0 || inputLength < 0)
-        {
-            throw new InvalidDataException("LZ4 header contained a negative length.");
-        }
-
-        if (outputLength > maxRawFileBytes)
-        {
-            throw new InvalidDataException($"Wrapped LZ4 output length too large ({outputLength} bytes).");
-        }
-
-        var remainingLength = fileLength - HeaderSize;
-        if (inputLength != remainingLength)
-        {
-            throw new InvalidDataException("LZ4 header length does not match file size.");
-        }
-
-        if ((outputLength == 0 && inputLength != 0) || inputLength > outputLength)
-        {
-            throw new InvalidDataException("LZ4 header is invalid.");
-        }
-    }
 
 }

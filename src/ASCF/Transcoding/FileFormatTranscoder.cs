@@ -332,7 +332,7 @@ public static class FileFormatTranscoder
         Lz4FormatOptions options,
         CancellationToken token)
     {
-        var input = new FileStream(wrappedPath, FileMode.Open, FileAccess.Read, FileShare.Read, options.BufferSize, useAsync: true);
+        var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             input.Position = WrappedLz4FileFormat.HeaderSize;

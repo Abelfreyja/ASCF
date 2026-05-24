@@ -14,39 +14,27 @@ public static class Lz4StreamFormat
         CancellationToken token)
         => ConvertToAscfFileAsync(compressedPath, outputPath, streamBufferSize, AscfWriterOptions.Default, token);
 
-    public static async Task<AscfFileWriter.WriteResult> ConvertToAscfFileAsync(
+    public static Task<AscfFileWriter.WriteResult> ConvertToAscfFileAsync(
         string compressedPath,
         string outputPath,
         int streamBufferSize,
         AscfWriterOptions ascfOptions,
         CancellationToken token)
-    {
-        FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
+        => UseDecompressedStreamAsync(
+            compressedPath,
+            streamBufferSize,
+            lz4Stream => AscfFileWriter.WriteStreamToFileAsync(lz4Stream, outputPath, ascfOptions, token));
 
-        var compressedStream = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
-        await using (compressedStream.ConfigureAwait(false))
-        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
-        {
-            return await AscfFileWriter.WriteStreamToFileAsync(lz4Stream, outputPath, ascfOptions, token).ConfigureAwait(false);
-        }
-    }
-
-    public static async Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
+    public static Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
         string compressedPath,
         string outputPath,
         int streamBufferSize,
         AscfWriterOptions ascfOptions,
         CancellationToken token)
-    {
-        FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
-
-        var compressedStream = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
-        await using (compressedStream.ConfigureAwait(false))
-        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
-        {
-            return await AscfFileWriter.WriteStreamToFileWithHashAsync(lz4Stream, outputPath, ascfOptions, token).ConfigureAwait(false);
-        }
-    }
+        => UseDecompressedStreamAsync(
+            compressedPath,
+            streamBufferSize,
+            lz4Stream => AscfFileWriter.WriteStreamToFileWithHashAsync(lz4Stream, outputPath, ascfOptions, token));
 
     public static Task<long> ExtractToRawFileAsync(
         string compressedPath,
@@ -65,32 +53,37 @@ public static class Lz4StreamFormat
         CancellationToken token)
     {
         options.Validate();
-        FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
-        var compressedStream = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
         var outputStream = stagedFile.OpenSequentialWrite(streamBufferSize);
         long rawSize;
-        await using (compressedStream.ConfigureAwait(false))
         await using (outputStream.ConfigureAwait(false))
-        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
         {
-            var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
-            try
-            {
-                rawSize = 0;
-                int read;
-                while ((read = await lz4Stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false)) > 0)
-                {
-                    rawSize = AddRawSize(rawSize, read, options.MaxRawFileBytes);
-                    await outputStream.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
+            rawSize = await UseDecompressedStreamAsync(
+                    compressedPath,
+                    streamBufferSize,
+                    async lz4Stream =>
+                    {
+                        var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
+                        try
+                        {
+                            long written = 0;
+                            int read;
+                            while ((read = await lz4Stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false)) > 0)
+                            {
+                                written = AddRawSize(written, read, options.MaxRawFileBytes);
+                                await outputStream.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
+                            }
+
+                            return written;
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(buffer);
+                        }
+                    })
+                .ConfigureAwait(false);
         }
 
         stagedFile.Commit();
@@ -104,7 +97,7 @@ public static class Lz4StreamFormat
         CancellationToken token)
         => ComputeFileHashAsync(compressedPath, streamBufferSize, copyBufferSize, Lz4FormatOptions.Default, token);
 
-    public static async Task<FileFormatHashResult> ComputeFileHashAsync(
+    public static Task<FileFormatHashResult> ComputeFileHashAsync(
         string compressedPath,
         int streamBufferSize,
         int copyBufferSize,
@@ -112,31 +105,31 @@ public static class Lz4StreamFormat
         CancellationToken token)
     {
         options.Validate();
-        FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
-        var compressedStream = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, useAsync: true);
-        await using (compressedStream.ConfigureAwait(false))
-        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
-        using (var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1))
-        {
-            var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
-            try
+        return UseDecompressedStreamAsync(
+            compressedPath,
+            streamBufferSize,
+            async lz4Stream =>
             {
-                long rawSize = 0;
-                int read;
-                while ((read = await lz4Stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false)) > 0)
+                using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
+                var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
+                try
                 {
-                    hasher.AppendData(buffer.AsSpan(0, read));
-                    rawSize = AddRawSize(rawSize, read, options.MaxRawFileBytes);
-                }
+                    long rawSize = 0;
+                    int read;
+                    while ((read = await lz4Stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token).ConfigureAwait(false)) > 0)
+                    {
+                        hasher.AppendData(buffer.AsSpan(0, read));
+                        rawSize = AddRawSize(rawSize, read, options.MaxRawFileBytes);
+                    }
 
-                return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), rawSize);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
-        }
+                    return new FileFormatHashResult(Convert.ToHexString(hasher.GetHashAndReset()), rawSize);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            });
     }
 
     public static FileFormatHashResult ComputeFileHash(
@@ -154,7 +147,7 @@ public static class Lz4StreamFormat
         options.Validate();
         FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
         FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
-        using var compressedStream = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read, streamBufferSize, FileOptions.SequentialScan);
+        using var compressedStream = FileFormatStreams.OpenSequentialRead(compressedPath, streamBufferSize);
         using var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression);
         using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
         var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
@@ -185,5 +178,20 @@ public static class Lz4StreamFormat
         }
 
         return next;
+    }
+
+    private static async Task<T> UseDecompressedStreamAsync<T>(
+        string compressedPath,
+        int streamBufferSize,
+        Func<Stream, Task<T>> action)
+    {
+        FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
+
+        var compressedStream = FileFormatStreams.OpenReadAsync(compressedPath, streamBufferSize);
+        await using (compressedStream.ConfigureAwait(false))
+        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
+        {
+            return await action(lz4Stream).ConfigureAwait(false);
+        }
     }
 }

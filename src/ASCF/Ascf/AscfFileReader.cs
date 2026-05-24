@@ -48,13 +48,7 @@ public static class AscfFileReader
     public static async Task<bool> FileLooksLikeAscfAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var stream = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var stream = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize, FileShare.ReadWrite | FileShare.Delete);
         await using (stream.ConfigureAwait(false))
         {
             if (stream.Length < AscfFileFormat.HeaderSize)
@@ -74,13 +68,7 @@ public static class AscfFileReader
     public static AscfRawHashes ReadRawHashes(string path, AscfReaderOptions options)
     {
         options.Validate();
-        using var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(path, options.BufferSize);
 
         return ReadHeader(input, options).RawHashes.ToPublic();
     }
@@ -91,13 +79,7 @@ public static class AscfFileReader
     public static AscfFileMetadata ReadMetadata(string path, AscfReaderOptions options)
     {
         options.Validate();
-        using var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(path, options.BufferSize);
 
         var header = ReadHeader(input, options);
         return ToMetadata(header, input.Length);
@@ -109,13 +91,7 @@ public static class AscfFileReader
     public static async Task<AscfRawHashes> ReadRawHashesAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
@@ -129,13 +105,7 @@ public static class AscfFileReader
     public static async Task<AscfFileMetadata> ReadMetadataAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
@@ -151,13 +121,7 @@ public static class AscfFileReader
     public static async Task<AscfResumeInfo> ReadResumeInfoAsync(string path, long encodedBytes, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
@@ -176,13 +140,7 @@ public static class AscfFileReader
     public static AscfChunkIndex ReadChunkIndex(string path, AscfReaderOptions options)
     {
         options.Validate();
-        using var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(path, options.BufferSize);
 
         var fileHeader = ReadHeader(input, options);
         return ReadChunkIndexFromEnd(input, fileHeader);
@@ -196,13 +154,7 @@ public static class AscfFileReader
     public static async Task<AscfChunkIndex> ReadChunkIndexAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
@@ -218,13 +170,7 @@ public static class AscfFileReader
     public static async Task<AscfPartialValidationResult> ValidatePartialFileAsync(string path, AscfReaderOptions options, CancellationToken token)
     {
         options.Validate();
-        var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize, FileShare.ReadWrite | FileShare.Delete);
         await using (input.ConfigureAwait(false))
         {
             if (input.Length < AscfFileFormat.HeaderSize)
@@ -309,13 +255,7 @@ public static class AscfFileReader
     public static DecodeResult ComputeFileHash(string inputPath, AscfReaderOptions options)
     {
         ValidateHashResultOptions(options);
-        using var input = new FileStream(
-            inputPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.SequentialScan);
+        using var input = FileFormatStreams.OpenSequentialRead(inputPath, options.BufferSize);
         var fileHeader = ReadHeader(input, options);
         using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
 
@@ -549,13 +489,7 @@ public static class AscfFileReader
         options.Validate();
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
-        var input = new FileStream(
-            inputPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.RandomAccess);
+        var input = FileFormatStreams.OpenRandomReadAsync(inputPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
@@ -717,13 +651,7 @@ public static class AscfFileReader
         options.Validate();
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
-        var input = new FileStream(
-            inputPath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: options.BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var input = FileFormatStreams.OpenSequentialReadAsync(inputPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
         {
             var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);

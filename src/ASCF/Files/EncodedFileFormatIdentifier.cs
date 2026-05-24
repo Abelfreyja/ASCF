@@ -52,13 +52,7 @@ public static class EncodedFileFormatIdentifier
         int read;
         try
         {
-            using var input = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete,
-                bufferSize: HeaderBufferSize,
-                FileOptions.SequentialScan);
+            using var input = FileFormatStreams.OpenSequentialRead(path, HeaderBufferSize, FileShare.ReadWrite | FileShare.Delete);
 
             read = FileFormatStreamReader.ReadUpTo(input, header[..bytesToRead]);
         }
