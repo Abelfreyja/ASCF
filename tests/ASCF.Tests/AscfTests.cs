@@ -36,6 +36,10 @@ public sealed class AscfTests : IDisposable
         var decoded = await File.ReadAllBytesAsync(decodedPath);
         var streamDecoded = await File.ReadAllBytesAsync(streamDecodedPath);
         var encoded = await File.ReadAllBytesAsync(ascfPath);
+        Assert.True(AscfFileReader.TryReadMetadata(encoded.AsSpan(0, AscfFileFormat.HeaderSize), encoded.Length, out var metadata));
+        Assert.Equal(raw.Length, metadata.RawSize);
+        Assert.Equal(encoded.Length, metadata.EncodedSize);
+
         var decodedFromArray = AscfFileReader.DecodeToArray(encoded);
         var wrappedEncoded = new byte[encoded.Length + 32];
         encoded.CopyTo(wrappedEncoded.AsSpan(17));

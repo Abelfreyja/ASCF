@@ -42,6 +42,45 @@ public static class AscfFileReader
         return AscfFileHeaderCodec.TryRead(buffer, options.MaxRawFileBytes, out _);
     }
 
+    public static bool TryReadMetadata(ReadOnlySpan<byte> header, long encodedSize, out AscfFileMetadata metadata)
+        => TryReadMetadata(header, encodedSize, AscfReaderOptions.Default, out metadata);
+
+    public static bool TryReadMetadata(ReadOnlySpan<byte> header, long encodedSize, AscfReaderOptions options, out AscfFileMetadata metadata)
+    {
+        options.Validate();
+        metadata = default;
+        if (header.Length < AscfFileFormat.HeaderSize || encodedSize < AscfFileFormat.HeaderSize)
+        {
+            return false;
+        }
+
+        if (!AscfFileHeaderCodec.TryRead(header[..AscfFileFormat.HeaderSize], options.MaxRawFileBytes, out var fileHeader))
+        {
+            return false;
+        }
+
+        try
+        {
+            ValidateRequiredStoredHashes(fileHeader, options);
+            ValidateEncodedSize(fileHeader, encodedSize);
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+
+        metadata = ToMetadata(fileHeader, encodedSize);
+        return true;
+    }
+
+    public static AscfFileMetadata ReadMetadata(ReadOnlySpan<byte> header, long encodedSize)
+        => ReadMetadata(header, encodedSize, AscfReaderOptions.Default);
+
+    public static AscfFileMetadata ReadMetadata(ReadOnlySpan<byte> header, long encodedSize, AscfReaderOptions options)
+        => TryReadMetadata(header, encodedSize, options, out var metadata)
+            ? metadata
+            : throw new InvalidDataException(".ascf header is invalid.");
+
     public static Task<bool> FileLooksLikeAscfAsync(string path, CancellationToken token)
         => FileLooksLikeAscfAsync(path, AscfReaderOptions.Default, token);
 
