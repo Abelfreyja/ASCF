@@ -920,7 +920,14 @@ public sealed class AscfTests : IDisposable
                 AscfFileFormat.DefaultBufferSize,
                 AscfFileFormat.DefaultBufferSize,
                 CancellationToken.None);
+        var extractedPath = Path.Combine(_testDirectory, "wrapped-hashes-extracted.raw");
+        var extractHashes = await WrappedLz4FileFormat
+            .ExtractToRawFileWithHashAsync(wrappedPath, extractedPath, algorithms, CancellationToken.None);
         var bufferHashes = WrappedLz4FileFormat.ComputeRawHashes(
+            await File.ReadAllBytesAsync(wrappedPath),
+            algorithms,
+            Lz4FormatOptions.Default);
+        var decoded = WrappedLz4FileFormat.DecodeToArrayWithHash(
             await File.ReadAllBytesAsync(wrappedPath),
             algorithms,
             Lz4FormatOptions.Default);
@@ -931,11 +938,19 @@ public sealed class AscfTests : IDisposable
         Assert.Equal(expectedBlake3, writeResult.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
         Assert.Equal(expectedSha1, fileHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
         Assert.Equal(expectedBlake3, fileHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(expectedSha1, extractHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, extractHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
         Assert.Equal(expectedSha1, bufferHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
         Assert.Equal(expectedBlake3, bufferHashes.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
+        Assert.Equal(expectedSha1, decoded.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(expectedBlake3, decoded.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
         Assert.Equal(raw.Length, writeResult.OriginalSize);
         Assert.Equal(raw.Length, fileHashes.RawSize);
+        Assert.Equal(raw.Length, extractHashes.RawSize);
         Assert.Equal(raw.Length, bufferHashes.RawSize);
+        Assert.Equal(raw.Length, decoded.RawSize);
+        Assert.Equal(raw, await File.ReadAllBytesAsync(extractedPath));
+        Assert.Equal(raw, decoded.Raw);
     }
 
     [Fact]
@@ -1415,6 +1430,7 @@ public sealed class AscfTests : IDisposable
         var sourcePath = WriteSource(raw);
         var wrappedPath = Path.Combine(_testDirectory, $"{Guid.NewGuid():N}.llz4");
         var outputPath = Path.Combine(_testDirectory, $"{Guid.NewGuid():N}.raw");
+        var hashedOutputPath = Path.Combine(_testDirectory, $"{Guid.NewGuid():N}.raw");
         byte[] sentinel = [0xAC, 0xCF, 0x42];
         AscfBufferTransform transform = static buffer =>
         {
@@ -1434,13 +1450,31 @@ public sealed class AscfTests : IDisposable
         var rawSize = await WrappedLz4FileFormat
             .ExtractStreamToRawFileAsync(stream, encoded.Length, outputPath, transform, options ?? Lz4FormatOptions.Default, CancellationToken.None)
             .ConfigureAwait(false);
+        using var hashedStream = new MemoryStream(transformed.Concat(sentinel).ToArray());
+        var hashedResult = await WrappedLz4FileFormat
+            .ExtractStreamToRawFileWithHashAsync(
+                hashedStream,
+                encoded.Length,
+                hashedOutputPath,
+                AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3,
+                transform,
+                options ?? Lz4FormatOptions.Default,
+                CancellationToken.None)
+            .ConfigureAwait(false);
 
         Assert.Equal(expectStoredRaw, header.InputLength == header.OutputLength);
         Assert.Equal(raw.Length, rawSize);
+        Assert.Equal(raw.Length, hashedResult.RawSize);
         Assert.Equal(encoded.Length, stream.Position);
+        Assert.Equal(encoded.Length, hashedStream.Position);
         Assert.Equal(sentinel, stream.ToArray().AsSpan(encoded.Length).ToArray());
+        Assert.Equal(sentinel, hashedStream.ToArray().AsSpan(encoded.Length).ToArray());
         Assert.Equal(raw, await File.ReadAllBytesAsync(outputPath).ConfigureAwait(false));
+        Assert.Equal(raw, await File.ReadAllBytesAsync(hashedOutputPath).ConfigureAwait(false));
+        Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), hashedResult.Hashes.RequireHash(AscfRawHashAlgorithms.Sha1));
+        Assert.Equal(ComputeBlake3Hex(raw), hashedResult.Hashes.RequireHash(AscfRawHashAlgorithms.Blake3));
         AssertNoStagingFiles(outputPath);
+        AssertNoStagingFiles(hashedOutputPath);
     }
 
     private static byte[] CreateMixedPayload(int length)
