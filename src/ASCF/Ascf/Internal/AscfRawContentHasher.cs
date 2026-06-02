@@ -16,7 +16,7 @@ internal sealed class AscfRawContentHasher : IDisposable
             : null;
         if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Blake3))
         {
-            _blake3 = Hasher.New();
+            _blake3 = AscfBlake3.CreateHasher();
             _hasBlake3 = true;
         }
     }
