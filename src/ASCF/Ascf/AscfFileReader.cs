@@ -288,6 +288,35 @@ public static class AscfFileReader
     public static DecodedArrayResult DecodeToArrayWithHash(byte[] encoded, AscfReaderOptions options)
         => DecodeToArrayWithHash(encoded.AsSpan(), options);
 
+    public static Task<byte[]> DecodeFileToArrayAsync(string inputPath, CancellationToken token)
+        => DecodeFileToArrayAsync(inputPath, AscfReaderOptions.Default, token);
+
+    public static async Task<byte[]> DecodeFileToArrayAsync(string inputPath, AscfReaderOptions options, CancellationToken token)
+    {
+        options.Validate();
+        var input = FileFormatStreams.OpenSequentialReadAsync(inputPath, options.BufferSize);
+        await using (input.ConfigureAwait(false))
+        {
+            return await DecodeStreamToArrayAsync(input, transform: null, options, token).ConfigureAwait(false);
+        }
+    }
+
+    public static Task<byte[]> DecodeStreamToArrayAsync(Stream encodedStream, CancellationToken token)
+        => DecodeStreamToArrayAsync(encodedStream, transform: null, AscfReaderOptions.Default, token);
+
+    public static Task<byte[]> DecodeStreamToArrayAsync(
+        Stream encodedStream,
+        AscfReaderOptions options,
+        CancellationToken token)
+        => DecodeStreamToArrayAsync(encodedStream, transform: null, options, token);
+
+    public static Task<byte[]> DecodeStreamToArrayAsync(
+        Stream encodedStream,
+        AscfBufferTransform? transform,
+        AscfReaderOptions options,
+        CancellationToken token)
+        => DecodeStreamToArrayCoreAsync(encodedStream, transform, options, token);
+
     public static DecodeResult ComputeFileHash(string inputPath)
         => ComputeFileHash(inputPath, AscfReaderOptions.Default);
 
@@ -1057,6 +1086,64 @@ public static class AscfFileReader
         }
 
         return new DecodedChunkResult(rawSize, encodedOffset, entries);
+    }
+
+    private static async Task<byte[]> DecodeStreamToArrayCoreAsync(
+        Stream encodedStream,
+        AscfBufferTransform? transform,
+        AscfReaderOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+
+        var header = new byte[AscfFileFormat.HeaderSize];
+        var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
+        await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
+        var fileHeader = ValidateHeader(
+            header,
+            options,
+            encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
+        var raw = AllocateInMemoryDecodeBuffer(fileHeader, options);
+
+        using var output = new MemoryStream(raw, 0, raw.Length, writable: true, publiclyVisible: true);
+        var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
+        var maxStoredPayloadSize = fileHeader.RawChunkSize;
+        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
+        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
+        try
+        {
+            var decoded = await DecodeChunksAsync(
+                    encodedStream,
+                    output,
+                    hasher: null,
+                    fileHeader,
+                    chunkHeader,
+                    compressedBuffer,
+                    rawBuffer,
+                    transform,
+                    writeWirePayload: false,
+                    token)
+                .ConfigureAwait(false);
+            await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token)
+                .ConfigureAwait(false);
+
+            if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
+            {
+                throw new InvalidDataException(".ascf stream contained trailing bytes.");
+            }
+
+            if (output.Position != raw.Length)
+            {
+                throw new InvalidDataException(".ascf decoded raw size did not match the header.");
+            }
+
+            return raw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rawBuffer);
+            ArrayPool<byte>.Shared.Return(compressedBuffer);
+        }
     }
 
     private static async Task DecodeIndexedChunksInOrderAsync(

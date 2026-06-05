@@ -41,6 +41,11 @@ public sealed class AscfTests : IDisposable
         Assert.Equal(encoded.Length, metadata.EncodedSize);
 
         var decodedFromArray = AscfFileReader.DecodeToArray(encoded);
+        var decodedFromFileArray = await AscfFileReader.DecodeFileToArrayAsync(ascfPath, CancellationToken.None);
+        await using var arrayStream = File.OpenRead(ascfPath);
+        var decodedFromStreamArray = await AscfFileReader
+            .DecodeStreamToArrayAsync(arrayStream, CancellationToken.None)
+            .ConfigureAwait(false);
         var wrappedEncoded = new byte[encoded.Length + 32];
         encoded.CopyTo(wrappedEncoded.AsSpan(17));
         var decodedFromSpan = AscfFileReader.DecodeToArray(wrappedEncoded.AsSpan(17, encoded.Length));
@@ -58,6 +63,8 @@ public sealed class AscfTests : IDisposable
         Assert.Equal(raw, decoded);
         Assert.Equal(raw, streamDecoded);
         Assert.Equal(raw, decodedFromArray);
+        Assert.Equal(raw, decodedFromFileArray);
+        Assert.Equal(raw, decodedFromStreamArray);
         Assert.Equal(raw, decodedFromSpan);
     }
 
