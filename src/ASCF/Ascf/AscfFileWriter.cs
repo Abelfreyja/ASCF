@@ -270,6 +270,39 @@ public static class AscfFileWriter
         return new HashedWriteResult(GetResultHashes(result.RawHashes, options.GetResultHashAlgorithms()), result.RawSize, result.StoredSize);
     }
 
+    public static Task<long> WriteStoredRawStreamToFileAsync(
+        Stream source,
+        long rawLength,
+        string outputPath,
+        CancellationToken token)
+        => WriteStoredRawStreamToFileAsync(source, rawLength, outputPath, AscfWriterOptions.Default, token);
+
+    public static async Task<long> WriteStoredRawStreamToFileAsync(
+        Stream source,
+        long rawLength,
+        string outputPath,
+        AscfWriterOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        var result = await WriteStoredRawStreamToFileInternalAsync(source, rawLength, outputPath, options, AscfRawHashAlgorithms.None, token)
+            .ConfigureAwait(false);
+        return result.StoredSize;
+    }
+
+    public static async Task<HashedWriteResult> WriteStoredRawStreamToFileWithHashAsync(
+        Stream source,
+        long rawLength,
+        string outputPath,
+        AscfWriterOptions options,
+        CancellationToken token)
+    {
+        ValidateHashOptions(options);
+        var result = await WriteStoredRawStreamToFileInternalAsync(source, rawLength, outputPath, options, options.GetResultHashAlgorithms(), token)
+            .ConfigureAwait(false);
+        return new HashedWriteResult(GetResultHashes(result.RawHashes, options.GetResultHashAlgorithms()), result.RawSize, result.StoredSize);
+    }
+
     private static async Task<(long RawSize, long StoredSize, AscfRawHashBytes RawHashes)> WriteStoredRawFileInternalAsync(
         string sourcePath,
         long sourceOffset,
@@ -321,6 +354,49 @@ public static class AscfFileWriter
 
                 result = (rawLength, output.Length, rawHashes);
             }
+        }
+
+        stagedFile.Commit();
+        return result;
+    }
+
+    private static async Task<(long RawSize, long StoredSize, AscfRawHashBytes RawHashes)> WriteStoredRawStreamToFileInternalAsync(
+        Stream source,
+        long rawLength,
+        string outputPath,
+        AscfWriterOptions options,
+        AscfRawHashAlgorithms requiredHashAlgorithms,
+        CancellationToken token)
+    {
+        ValidateRawSize(rawLength, options.MaxRawFileBytes);
+        ValidateKnownStreamRawSize(source, rawLength);
+        using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
+
+        (long RawSize, long StoredSize, AscfRawHashBytes RawHashes) result;
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
+        await using (output.ConfigureAwait(false))
+        {
+            using var hasher = CreateRawHasher(options.RawHashAlgorithms | requiredHashAlgorithms);
+            var chunkCount = AscfFileFormat.GetChunkCount(rawLength, options.RawChunkSize);
+            var streamId = GetStreamId(options);
+            var writeOptions = new WriteOptions(options, null, null, null);
+            await WriteHeaderAsync(output, rawLength, options.RawChunkSize, chunkCount, streamId, 0, writeOptions, token).ConfigureAwait(false);
+            var entries = await WriteStoredRawChunksAsync(source, output, rawLength, chunkCount, options.RawChunkSize, hasher, token).ConfigureAwait(false);
+            var indexOffset = GetEncodedOffset(entries);
+            await WriteIndexAsync(output, entries, rawLength, indexOffset, writeOptions, token).ConfigureAwait(false);
+            var rawHashes = hasher?.FinalizeHashes() ?? AscfRawHashBytes.Empty;
+            await RewriteHeaderAsync(
+                    output,
+                    rawLength,
+                    options.RawChunkSize,
+                    chunkCount,
+                    streamId,
+                    output.Length,
+                    GetHeaderRawHashes(rawHashes, options),
+                    token)
+                .ConfigureAwait(false);
+
+            result = (rawLength, output.Length, rawHashes);
         }
 
         stagedFile.Commit();
@@ -1082,6 +1158,20 @@ public static class AscfFileWriter
 
         var rawSize = Math.Max(0, checked(source.Length - source.Position));
         ValidateRawSize(rawSize, options.MaxRawFileBytes);
+    }
+
+    private static void ValidateKnownStreamRawSize(Stream source, long rawLength)
+    {
+        if (!source.CanSeek)
+        {
+            return;
+        }
+
+        var remaining = Math.Max(0, checked(source.Length - source.Position));
+        if (remaining < rawLength)
+        {
+            throw new InvalidDataException($".ascf stored raw stream is shorter than declared ({remaining} < {rawLength} bytes).");
+        }
     }
 
     private static async ValueTask WriteBytesAsync(Stream destination, ReadOnlyMemory<byte> buffer, WriteOptions options, CancellationToken token)

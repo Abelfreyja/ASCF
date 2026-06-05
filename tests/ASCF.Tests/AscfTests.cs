@@ -92,6 +92,33 @@ public sealed class AscfTests : IDisposable
     }
 
     [Fact]
+    public async Task WriteStoredRawStreamPreservesRawBytes()
+    {
+        var raw = CreateMixedPayload(1024 * 1024 + 59);
+        var ascfPath = Path.Combine(_testDirectory, "stored-raw-stream.ascf");
+        var decodedPath = Path.Combine(_testDirectory, "stored-raw-stream.raw");
+        var options = AscfWriterOptions.Default with
+        {
+            RawHashAlgorithms = AscfRawHashAlgorithms.Sha1 | AscfRawHashAlgorithms.Blake3,
+            ResultHashAlgorithms = AscfRawHashAlgorithms.Blake3
+        };
+        using var source = new MemoryStream(raw, writable: false);
+
+        var result = await AscfFileWriter
+            .WriteStoredRawStreamToFileWithHashAsync(source, raw.Length, ascfPath, options, CancellationToken.None)
+            .ConfigureAwait(false);
+        var decodedSize = await AscfFileReader.DecodeFileToFileAsync(ascfPath, decodedPath, CancellationToken.None);
+        var hashes = AscfFileReader.ReadRawHashes(ascfPath);
+
+        Assert.Equal(raw.Length, result.RawSize);
+        Assert.Equal(raw.Length, decodedSize);
+        Assert.Equal(ComputeBlake3Hex(raw), result.Hashes.Blake3);
+        Assert.Equal(Convert.ToHexString(SHA1.HashData(raw)), hashes.Sha1);
+        Assert.Equal(ComputeBlake3Hex(raw), hashes.Blake3);
+        Assert.Equal(raw, await File.ReadAllBytesAsync(decodedPath));
+    }
+
+    [Fact]
     public async Task IdentifyAsyncResetsTransformedStreamPosition()
     {
         var raw = CreateMixedPayload(128 * 1024 + 11);
