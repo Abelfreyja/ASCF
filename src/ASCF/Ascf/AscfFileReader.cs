@@ -721,7 +721,7 @@ public static class AscfFileReader
                 await output.FlushAsync(token).ConfigureAwait(false);
                 output.Position = 0;
                 hashes = await ComputeHashesAsync(output, GetHashAlgorithms(fileHeader, options), options.BufferSize, token).ConfigureAwait(false);
-                ValidateStoredHashes(fileHeader, hashes);
+                ValidateComputedStoredHashes(fileHeader, hashes);
             }
 
             return computeHash
@@ -982,13 +982,36 @@ public static class AscfFileReader
         return RequireHash(result);
     }
 
-    public static async Task<DecodeResult> DecodeReadyStreamToRawFilePreferStoredHashesAsync(
+    public static Task<DecodeResult> DecodeReadyStreamToRawFilePreferStoredHashesAsync(
         Stream encodedStream,
         long? encodedLength,
         string outputPath,
         AscfBufferTransform? transform,
         AscfReaderOptions options,
         IAscfStreamDecodeScheduler scheduler,
+        CancellationToken token)
+        => DecodeReadyStreamToRawFileCoreAsync(encodedStream, encodedLength, outputPath, transform, options,
+            scheduler, preferStoredResultHashes: true, token);
+
+    public static Task<DecodeResult> DecodeReadyStreamToRawFileAsync(
+        Stream encodedStream,
+        long? encodedLength,
+        string outputPath,
+        AscfBufferTransform? transform,
+        AscfReaderOptions options,
+        IAscfStreamDecodeScheduler scheduler,
+        CancellationToken token)
+        => DecodeReadyStreamToRawFileCoreAsync(encodedStream, encodedLength, outputPath, transform, options,
+            scheduler, preferStoredResultHashes: false, token);
+
+    private static async Task<DecodeResult> DecodeReadyStreamToRawFileCoreAsync(
+        Stream encodedStream,
+        long? encodedLength,
+        string outputPath,
+        AscfBufferTransform? transform,
+        AscfReaderOptions options,
+        IAscfStreamDecodeScheduler scheduler,
+        bool preferStoredResultHashes,
         CancellationToken token)
     {
         ArgumentNullException.ThrowIfNull(scheduler);
@@ -998,7 +1021,7 @@ public static class AscfFileReader
             : null;
         DecodeFileResult result = await DecodeStreamToFileCoreAsync(
             limitedStream ?? encodedStream, outputPath, transform, options,
-            computeHash: true, preferStoredResultHashes: true, token, scheduler, encodedLength).ConfigureAwait(false);
+            computeHash: true, preferStoredResultHashes, token, scheduler, encodedLength).ConfigureAwait(false);
         return RequireHash(result);
     }
 
@@ -1659,6 +1682,9 @@ public static class AscfFileReader
         bool preferStoredResultHashes = false)
     {
         var resultAlgorithms = options.GetResultHashAlgorithms();
+        if (!options.VerifyAdditionalStoredHashes)
+            return resultAlgorithms;
+
         if (!preferStoredResultHashes)
         {
             return resultAlgorithms | fileHeader.RawHashes.Algorithms;
@@ -1678,14 +1704,8 @@ public static class AscfFileReader
     private static AscfRawHashBytes FinalizeHashes(AscfFileHeader fileHeader, AscfRawContentHasher hasher)
     {
         var rawHashes = hasher.FinalizeHashes();
-        ValidateStoredHashes(fileHeader, rawHashes);
+        ValidateComputedStoredHashes(fileHeader, rawHashes);
         return rawHashes;
-    }
-
-    private static void ValidateStoredHashes(AscfFileHeader fileHeader, AscfRawHashBytes computed)
-    {
-        ValidateStoredHash(fileHeader.RawHashes, computed, AscfRawHashAlgorithms.Sha1);
-        ValidateStoredHash(fileHeader.RawHashes, computed, AscfRawHashAlgorithms.Blake3);
     }
 
     private static void ValidateComputedStoredHashes(AscfFileHeader fileHeader, AscfRawHashBytes computed)

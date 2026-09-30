@@ -14,6 +14,7 @@ public sealed record AscfReaderOptions
     public int MaxParallelDecodeWorkerCount { get; init; } = AscfFileFormat.DefaultMaxParallelDecodeWorkerCount;
     public AscfParallelDecodeMode ParallelDecodeMode { get; init; } = AscfParallelDecodeMode.Auto;
     public AscfRawHashAlgorithms ResultHashAlgorithms { get; init; } = AscfRawHashAlgorithms.Sha1;
+    public bool VerifyAdditionalStoredHashes { get; init; } = true;
     public AscfRawHashAlgorithms RequiredStoredHashAlgorithms { get; init; } = AscfRawHashAlgorithms.None;
 
     internal int GetParallelDecodeWorkerCount()
