@@ -346,6 +346,17 @@ public static class AscfFileReader
         CancellationToken token)
         => DecodeStreamToArrayCoreAsync(encodedStream, transform, options, token);
 
+    public static async Task<byte[]> DecodeStreamToArrayAsync(
+        Stream encodedStream,
+        long encodedLength,
+        AscfReaderOptions options,
+        CancellationToken token)
+    {
+        using LengthLimitedReadStream input = new(encodedStream, encodedLength, leaveOpen: true);
+        return await DecodeStreamToArrayCoreAsync(input, transform: null, options, token, encodedLength)
+            .ConfigureAwait(false);
+    }
+
     public static DecodeResult ComputeFileHash(string inputPath)
         => ComputeFileHash(inputPath, AscfReaderOptions.Default);
 
@@ -1004,6 +1015,24 @@ public static class AscfFileReader
         => DecodeReadyStreamToRawFileCoreAsync(encodedStream, encodedLength, outputPath, transform, options,
             scheduler, preferStoredResultHashes: false, token);
 
+    public static async Task<long> DecodeReadyStreamToFileAsync(
+        Stream encodedStream,
+        long? encodedLength,
+        string outputPath,
+        AscfReaderOptions options,
+        IAscfStreamDecodeScheduler scheduler,
+        CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(scheduler);
+        using LengthLimitedReadStream? limitedStream = encodedLength is { } length
+            ? new LengthLimitedReadStream(encodedStream, length, leaveOpen: true)
+            : null;
+        DecodeFileResult result = await DecodeStreamToFileCoreAsync(limitedStream ?? encodedStream, outputPath, transform: null,
+            options, computeHash: false, preferStoredResultHashes: false, token, scheduler, encodedLength)
+            .ConfigureAwait(false);
+        return result.RawSize;
+    }
+
     private static async Task<DecodeResult> DecodeReadyStreamToRawFileCoreAsync(
         Stream encodedStream,
         long? encodedLength,
@@ -1315,7 +1344,7 @@ public static class AscfFileReader
 
     private static async Task<DecodedChunkResult> DecodeChunksAsync(
         Stream encodedStream,
-        Stream output,
+        Stream? output,
         AscfRawContentHasher? hasher,
         AscfFileHeader fileHeader,
         byte[] chunkHeader,
@@ -1325,7 +1354,8 @@ public static class AscfFileReader
         bool writeWirePayload,
         CancellationToken token,
         IAscfStreamDecodeScheduler? scheduler = null,
-        long? encodedLength = null)
+        long? encodedLength = null,
+        byte[]? decodedArray = null)
     {
         long rawSize = 0;
         long encodedOffset = AscfFileFormat.HeaderSize;
@@ -1344,11 +1374,12 @@ public static class AscfFileReader
             try
             {
                 byte[] compressed = compressedBuffer ?? ArrayPool<byte>.Shared.Rent(chunk.RawLength);
-                byte[] raw = rawBuffer ?? (chunk.StoresRaw ? [] : ArrayPool<byte>.Shared.Rent(chunk.RawLength));
+                byte[] raw = rawBuffer ?? (chunk.StoresRaw || decodedArray is not null ? [] : ArrayPool<byte>.Shared.Rent(chunk.RawLength));
                 try
                 {
+                    Memory<byte>? destination = decodedArray?.AsMemory(checked((int)rawSize), chunk.RawLength);
                     await ReadAndWriteChunkAsync(encodedStream, output, hasher, chunk, chunkHeader, compressed, raw,
-                        transform, writeWirePayload, token).ConfigureAwait(false);
+                        transform, writeWirePayload, token, destination).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -1386,34 +1417,39 @@ public static class AscfFileReader
     }
 
     private static async Task ReadAndWriteChunkAsync(
-        Stream encodedStream, Stream output, AscfRawContentHasher? hasher, AscfChunkHeader chunk,
+        Stream encodedStream, Stream? output, AscfRawContentHasher? hasher, AscfChunkHeader chunk,
         byte[] chunkHeader, byte[] compressedBuffer, byte[] rawBuffer,
-        AscfBufferTransform? transform, bool writeWirePayload, CancellationToken token)
+        AscfBufferTransform? transform, bool writeWirePayload, CancellationToken token,
+        Memory<byte>? destination = null)
     {
-        await ReadTransformedBytesAsync(encodedStream, compressedBuffer.AsMemory(0, chunk.StoredLength), transform, token).ConfigureAwait(false);
-        ValidateStoredChecksumAndRawIfStoredRaw(chunk, compressedBuffer.AsSpan(0, chunk.StoredLength));
+        Memory<byte> stored = chunk.StoresRaw && destination.HasValue
+            ? destination.Value
+            : compressedBuffer.AsMemory(0, chunk.StoredLength);
+        await ReadTransformedBytesAsync(encodedStream, stored, transform, token).ConfigureAwait(false);
+        ValidateStoredChecksumAndRawIfStoredRaw(chunk, stored.Span);
         if (writeWirePayload)
         {
-            await output.WriteAsync(chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
-            await output.WriteAsync(compressedBuffer.AsMemory(0, chunk.StoredLength), token).ConfigureAwait(false);
+            await output!.WriteAsync(chunkHeader.AsMemory(0, chunkHeader.Length), token).ConfigureAwait(false);
+            await output.WriteAsync(stored, token).ConfigureAwait(false);
         }
 
         if (chunk.StoresRaw)
         {
-            hasher?.AppendData(compressedBuffer.AsSpan(0, chunk.RawLength));
-            if (!writeWirePayload)
+            hasher?.AppendData(stored.Span);
+            if (!writeWirePayload && !destination.HasValue)
             {
-                await output.WriteAsync(compressedBuffer.AsMemory(0, chunk.RawLength), token).ConfigureAwait(false);
+                await output!.WriteAsync(stored, token).ConfigureAwait(false);
             }
         }
         else
         {
-            Lz4BlockCodec.Decode(compressedBuffer.AsSpan(0, chunk.StoredLength), rawBuffer.AsSpan(0, chunk.RawLength), chunk.RawLength);
-            ValidateRawChecksum(chunk, rawBuffer.AsSpan(0, chunk.RawLength));
-            hasher?.AppendData(rawBuffer.AsSpan(0, chunk.RawLength));
-            if (!writeWirePayload)
+            Memory<byte> raw = destination ?? rawBuffer.AsMemory(0, chunk.RawLength);
+            Lz4BlockCodec.Decode(stored.Span, raw.Span, chunk.RawLength);
+            ValidateRawChecksum(chunk, raw.Span);
+            hasher?.AppendData(raw.Span);
+            if (!writeWirePayload && !destination.HasValue)
             {
-                await output.WriteAsync(rawBuffer.AsMemory(0, chunk.RawLength), token).ConfigureAwait(false);
+                await output!.WriteAsync(raw, token).ConfigureAwait(false);
             }
         }
     }
@@ -1422,7 +1458,8 @@ public static class AscfFileReader
         Stream encodedStream,
         AscfBufferTransform? transform,
         AscfReaderOptions options,
-        CancellationToken token)
+        CancellationToken token,
+        long? encodedLength = null)
     {
         options.Validate();
 
@@ -1432,27 +1469,26 @@ public static class AscfFileReader
         var fileHeader = ValidateHeader(
             header,
             options,
-            encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
+            encodedLength ?? (encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null));
         var raw = AllocateInMemoryDecodeBuffer(fileHeader, options);
 
-        using var output = new MemoryStream(raw, 0, raw.Length, writable: true, publiclyVisible: true);
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var maxStoredPayloadSize = fileHeader.RawChunkSize;
         var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
-        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
         try
         {
             var decoded = await DecodeChunksAsync(
                     encodedStream,
-                    output,
+                    output: null,
                     hasher: null,
                     fileHeader,
                     chunkHeader,
                     compressedBuffer,
-                    rawBuffer,
+                    rawBuffer: null,
                     transform,
                     writeWirePayload: false,
-                    token)
+                    token,
+                    decodedArray: raw)
                 .ConfigureAwait(false);
             await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token)
                 .ConfigureAwait(false);
@@ -1462,16 +1498,10 @@ public static class AscfFileReader
                 throw new InvalidDataException(".ascf stream contained trailing bytes.");
             }
 
-            if (output.Position != raw.Length)
-            {
-                throw new InvalidDataException(".ascf decoded raw size did not match the header.");
-            }
-
             return raw;
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rawBuffer);
             ArrayPool<byte>.Shared.Return(compressedBuffer);
         }
     }
