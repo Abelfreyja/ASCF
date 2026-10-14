@@ -5,6 +5,9 @@ namespace ASCF.Lz4;
 
 internal static unsafe class Lz4BlockCodec
 {
+    private static readonly bool _useNative = OperatingSystem.IsWindows()
+        && RuntimeInformation.ProcessArchitecture == Architecture.X64;
+
     [StructLayout(LayoutKind.Auto)]
     public readonly record struct EncodedBlock(int RawLength, int StoredLength)
     {
@@ -16,7 +19,9 @@ internal static unsafe class Lz4BlockCodec
 
     public static EncodedBlock Encode(ReadOnlySpan<byte> raw, Span<byte> compressedDestination)
     {
-        var encodedLength = LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L08_HC);
+        int encodedLength = _useNative
+            ? NativeLz4.EncodeHigh(raw, compressedDestination)
+            : LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L08_HC);
         return new EncodedBlock(raw.Length, ShouldStoreRaw(encodedLength, raw.Length) ? raw.Length : encodedLength);
     }
 
@@ -28,7 +33,9 @@ internal static unsafe class Lz4BlockCodec
         }
 
         // use fast lz4 as a cheap check before high compression
-        var fastLength = LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L00_FAST);
+        int fastLength = _useNative
+            ? NativeLz4.EncodeFast(raw, compressedDestination)
+            : LZ4Codec.Encode(raw, compressedDestination, LZ4Level.L00_FAST);
         if (ShouldStoreRaw(fastLength, raw.Length))
         {
             return new EncodedBlock(raw.Length, raw.Length);
@@ -39,7 +46,9 @@ internal static unsafe class Lz4BlockCodec
 
     public static EncodedBlock EncodeOrCopyRaw(byte* raw, int rawLength, byte* destination, int destinationLength)
     {
-        var encodedLength = LZ4Codec.Encode(raw, rawLength, destination, destinationLength, LZ4Level.L08_HC);
+        int encodedLength = _useNative
+            ? NativeLz4.EncodeHigh(new ReadOnlySpan<byte>(raw, rawLength), new Span<byte>(destination, destinationLength))
+            : LZ4Codec.Encode(raw, rawLength, destination, destinationLength, LZ4Level.L08_HC);
         if (!ShouldStoreRaw(encodedLength, rawLength))
         {
             return new EncodedBlock(rawLength, encodedLength);
@@ -54,21 +63,27 @@ internal static unsafe class Lz4BlockCodec
 
     public static int Decode(ReadOnlySpan<byte> stored, Span<byte> raw, int expectedRawLength)
     {
-        var decodedLength = LZ4Codec.Decode(stored, raw[..expectedRawLength]);
+        int decodedLength = _useNative
+            ? NativeLz4.Decode(stored, raw[..expectedRawLength])
+            : LZ4Codec.Decode(stored, raw[..expectedRawLength]);
         ValidateDecodedLength(decodedLength, expectedRawLength);
         return decodedLength;
     }
 
     public static int Decode(byte[] stored, int storedOffset, int storedLength, byte[] raw, int rawOffset, int expectedRawLength)
     {
-        var decodedLength = LZ4Codec.Decode(stored, storedOffset, storedLength, raw, rawOffset, expectedRawLength);
+        int decodedLength = _useNative
+            ? NativeLz4.Decode(stored.AsSpan(storedOffset, storedLength), raw.AsSpan(rawOffset, expectedRawLength))
+            : LZ4Codec.Decode(stored, storedOffset, storedLength, raw, rawOffset, expectedRawLength);
         ValidateDecodedLength(decodedLength, expectedRawLength);
         return decodedLength;
     }
 
     public static int Decode(byte* stored, int storedLength, byte* raw, int expectedRawLength)
     {
-        var decodedLength = LZ4Codec.Decode(stored, storedLength, raw, expectedRawLength);
+        int decodedLength = _useNative
+            ? NativeLz4.Decode(new ReadOnlySpan<byte>(stored, storedLength), new Span<byte>(raw, expectedRawLength))
+            : LZ4Codec.Decode(stored, storedLength, raw, expectedRawLength);
         ValidateDecodedLength(decodedLength, expectedRawLength);
         return decodedLength;
     }

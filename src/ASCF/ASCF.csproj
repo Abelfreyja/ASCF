@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -22,6 +22,21 @@
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Update="runtimes\win-x64\native\ascf_lz4_v1_10_0.dll"
+          Link="ascf_lz4_v1_10_0.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Pack="true" PackagePath="runtimes/win-x64/native/" />
+    <None Include="..\..\native\lz4\LICENSE" Link="LZ4.LICENSE.txt"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Pack="true" PackagePath="licenses/LZ4.LICENSE.txt" />
   </ItemGroup>
+
+  <Target Name="ValidateBundledLz4" BeforeTargets="PrepareForBuild"
+          Condition="'$(DesignTimeBuild)' != 'true'">
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)/runtimes/win-x64/native/ascf_lz4_v1_10_0.dll')"
+           Text="LZ4 DLL not found. Run native/Build-Lz4.cmd." />
+  </Target>
 
 </Project>
