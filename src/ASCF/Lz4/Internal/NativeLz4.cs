@@ -5,7 +5,7 @@ namespace ASCF.Lz4;
 
 internal static unsafe partial class NativeLz4
 {
-    private const string _library = "ascf_lz4_v1_10_0";
+    private const string _library = "ascf_lz4_v1_10_0.dll";
 
     static NativeLz4()
     {
