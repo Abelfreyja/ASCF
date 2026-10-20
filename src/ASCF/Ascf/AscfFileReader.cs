@@ -1015,6 +1015,30 @@ public static class AscfFileReader
         => DecodeReadyStreamToRawFileCoreAsync(encodedStream, encodedLength, outputPath, transform, options,
             scheduler, preferStoredResultHashes: false, token);
 
+    public static async Task<DecodeResult> DecodeReadyStreamToRawStreamAsync(
+        Stream encodedStream,
+        long? encodedLength,
+        Stream output,
+        AscfBufferTransform? transform,
+        AscfReaderOptions options,
+        IAscfStreamDecodeScheduler scheduler,
+        CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(encodedStream);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(scheduler);
+        if (!output.CanWrite)
+            throw new ArgumentException("Output stream must be writable.", nameof(output));
+        ValidateHashResultOptions(options);
+        using LengthLimitedReadStream? limitedStream = encodedLength is { } length
+            ? new LengthLimitedReadStream(encodedStream, length, leaveOpen: true)
+            : null;
+        DecodeFileResult result = await DecodeStreamToStreamCoreAsync(limitedStream ?? encodedStream, output,
+            transform, options, computeHash: true, token, scheduler: scheduler, encodedLength: encodedLength)
+            .ConfigureAwait(false);
+        return RequireHash(result);
+    }
+
     public static async Task<long> DecodeReadyStreamToFileAsync(
         Stream encodedStream,
         long? encodedLength,
@@ -1205,86 +1229,15 @@ public static class AscfFileReader
     {
         options.Validate();
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
-        DecodeFileResult decodedResult;
-
-        var header = new byte[AscfFileFormat.HeaderSize];
-        var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
-        await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
-        var fileHeader = ValidateHeader(
-            header,
-            options,
-            encodedLength ?? (encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null));
-
+        DecodeFileResult result;
         var output = stagedFile.OpenSequentialWrite(options.BufferSize);
         await using (output.ConfigureAwait(false))
         {
-            var hashAlgorithms = computeHash
-                ? GetHashAlgorithms(fileHeader, options, preferStoredResultHashes)
-                : AscfRawHashAlgorithms.None;
-            using var hasher = hashAlgorithms != AscfRawHashAlgorithms.None
-                ? CreateRawHasher(hashAlgorithms)
-                : null;
-
-            var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-            var maxStoredPayloadSize = fileHeader.RawChunkSize;
-            byte[]? compressedBuffer = scheduler is null ? ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize) : null;
-            byte[]? rawBuffer = scheduler is null ? ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize) : null;
-            try
-            {
-                var decoded = await DecodeChunksAsync(
-                        encodedStream,
-                        output,
-                        hasher,
-                        fileHeader,
-                        chunkHeader,
-                        compressedBuffer,
-                        rawBuffer,
-                        transform,
-                        writeWirePayload: false,
-                        token: token,
-                        scheduler,
-                        encodedLength)
-                    .ConfigureAwait(false);
-                if (scheduler is not null)
-                {
-                    await WaitForDecodeBytesAsync(scheduler,
-                        checked(decoded.EncodedOffset + (long)decoded.Entries.Count * AscfFileFormat.IndexEntrySize + AscfFileFormat.IndexFooterSize),
-                        encodedLength, token).ConfigureAwait(false);
-                }
-                IAsyncDisposable? lease = scheduler is null ? null : await scheduler.AcquireAsync(token).ConfigureAwait(false);
-                try
-                {
-                    await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token: token)
-                        .ConfigureAwait(false);
-                }
-                finally
-                {
-                    if (lease is not null)
-                        await lease.DisposeAsync().ConfigureAwait(false);
-                }
-
-                if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
-                {
-                    throw new InvalidDataException(".ascf stream contained trailing bytes.");
-                }
-
-                decodedResult = hasher is null
-                    ? CreateHashlessDecodeResult(fileHeader, decoded.RawSize)
-                    : preferStoredResultHashes
-                        ? CreatePreferredHashDecodeResult(fileHeader, hasher, options, decoded.RawSize)
-                        : CreateHashedDecodeResult(fileHeader, FinalizeHashes(fileHeader, hasher), options, decoded.RawSize);
-            }
-            finally
-            {
-                if (rawBuffer is not null)
-                    ArrayPool<byte>.Shared.Return(rawBuffer);
-                if (compressedBuffer is not null)
-                    ArrayPool<byte>.Shared.Return(compressedBuffer);
-            }
+            result = await DecodeStreamToStreamCoreAsync(encodedStream, output, transform, options,
+                computeHash, token, preferStoredResultHashes, scheduler, encodedLength).ConfigureAwait(false);
         }
-
         stagedFile.Commit();
-        return decodedResult;
+        return result;
     }
 
     private static async Task<DecodeFileResult> DecodeStreamToStreamCoreAsync(
@@ -1293,7 +1246,10 @@ public static class AscfFileReader
         AscfBufferTransform? transform,
         AscfReaderOptions options,
         bool computeHash,
-        CancellationToken token)
+        CancellationToken token,
+        bool preferStoredResultHashes = false,
+        IAscfStreamDecodeScheduler? scheduler = null,
+        long? encodedLength = null)
     {
         options.Validate();
         var header = new byte[AscfFileFormat.HeaderSize];
@@ -1302,13 +1258,19 @@ public static class AscfFileReader
         var fileHeader = ValidateHeader(
             header,
             options,
-            encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
+            encodedLength ?? (encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null));
 
-        using var hasher = computeHash ? CreateRawHasher(GetHashAlgorithms(fileHeader, options)) : null;
+        var hashAlgorithms = computeHash
+            ? GetHashAlgorithms(fileHeader, options, preferStoredResultHashes)
+            : AscfRawHashAlgorithms.None;
+        using var hasher = hashAlgorithms != AscfRawHashAlgorithms.None
+            ? CreateRawHasher(hashAlgorithms)
+            : null;
+
         var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
         var maxStoredPayloadSize = fileHeader.RawChunkSize;
-        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
-        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
+        byte[]? compressedBuffer = scheduler is null ? ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize) : null;
+        byte[]? rawBuffer = scheduler is null ? ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize) : null;
         try
         {
             var decoded = await DecodeChunksAsync(
@@ -1321,10 +1283,27 @@ public static class AscfFileReader
                     rawBuffer,
                     transform,
                     writeWirePayload: false,
-                    token: token)
+                    token: token,
+                    scheduler,
+                    encodedLength)
                 .ConfigureAwait(false);
-            await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token: token)
-                .ConfigureAwait(false);
+            if (scheduler is not null)
+            {
+                await WaitForDecodeBytesAsync(scheduler,
+                    checked(decoded.EncodedOffset + (long)decoded.Entries.Count * AscfFileFormat.IndexEntrySize + AscfFileFormat.IndexFooterSize),
+                    encodedLength, token).ConfigureAwait(false);
+            }
+            IAsyncDisposable? lease = scheduler is null ? null : await scheduler.AcquireAsync(token).ConfigureAwait(false);
+            try
+            {
+                await ReadAndValidateIndexAsync(encodedStream, output: null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: false, token: token)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                if (lease is not null)
+                    await lease.DisposeAsync().ConfigureAwait(false);
+            }
 
             if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
             {
@@ -1333,12 +1312,16 @@ public static class AscfFileReader
 
             return hasher is null
                 ? CreateHashlessDecodeResult(fileHeader, decoded.RawSize)
-                : CreateHashedDecodeResult(fileHeader, FinalizeHashes(fileHeader, hasher), options, decoded.RawSize);
+                : preferStoredResultHashes
+                    ? CreatePreferredHashDecodeResult(fileHeader, hasher, options, decoded.RawSize)
+                    : CreateHashedDecodeResult(fileHeader, FinalizeHashes(fileHeader, hasher), options, decoded.RawSize);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rawBuffer);
-            ArrayPool<byte>.Shared.Return(compressedBuffer);
+            if (rawBuffer is not null)
+                ArrayPool<byte>.Shared.Return(rawBuffer);
+            if (compressedBuffer is not null)
+                ArrayPool<byte>.Shared.Return(compressedBuffer);
         }
     }
 
