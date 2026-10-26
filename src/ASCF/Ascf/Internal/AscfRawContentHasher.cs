@@ -6,19 +6,16 @@ namespace ASCF;
 internal sealed class AscfRawContentHasher : IDisposable
 {
     private readonly IncrementalHash? _sha1;
-    private Hasher _blake3;
-    private readonly bool _hasBlake3;
+    private readonly Hasher? _blake3;
 
     private AscfRawContentHasher(AscfRawHashAlgorithms algorithms)
     {
         _sha1 = AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Sha1)
             ? IncrementalHash.CreateHash(HashAlgorithmName.SHA1)
             : null;
-        if (AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Blake3))
-        {
-            _blake3 = AscfBlake3.CreateHasher();
-            _hasBlake3 = true;
-        }
+        _blake3 = AscfRawHashAlgorithmFlags.Has(algorithms, AscfRawHashAlgorithms.Blake3)
+            ? AscfBlake3.CreateHasher()
+            : null;
     }
 
     public static AscfRawContentHasher? Create(AscfRawHashAlgorithms algorithms)
@@ -27,10 +24,7 @@ internal sealed class AscfRawContentHasher : IDisposable
     public void AppendData(ReadOnlySpan<byte> data)
     {
         _sha1?.AppendData(data);
-        if (_hasBlake3)
-        {
-            _blake3.Update(data);
-        }
+        _blake3?.Update(data);
     }
 
     public AscfRawHashBytes FinalizeHashes()
@@ -47,7 +41,7 @@ internal sealed class AscfRawContentHasher : IDisposable
             hashes = hashes.WithSha1(sha1);
         }
 
-        if (_hasBlake3)
+        if (_blake3 != null)
         {
             Span<byte> blake3 = stackalloc byte[AscfFileFormat.Blake3HashSize];
             _blake3.Finalize(blake3);
@@ -60,9 +54,6 @@ internal sealed class AscfRawContentHasher : IDisposable
     public void Dispose()
     {
         _sha1?.Dispose();
-        if (_hasBlake3)
-        {
-            _blake3.Dispose();
-        }
+        _blake3?.Dispose();
     }
 }
