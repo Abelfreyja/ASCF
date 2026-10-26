@@ -622,32 +622,41 @@ public static class AscfFileReader
         CancellationToken token)
     {
         options.Validate();
-        using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
-
         var input = FileFormatStreams.OpenRandomReadAsync(inputPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
-        {
-            var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
-            var chunkIndex = await ReadChunkIndexFromEndAsync(input, fileHeader, token).ConfigureAwait(false);
-            var workerCount = options.GetParallelDecodeWorkerCount();
-            if (ShouldDecodeCompleteFileInOrder(chunkIndex, workerCount))
-            {
-                var inOrderResult = await DecodeCompleteFileInOrderAsync(input, stagedFile, fileHeader, chunkIndex, options, computeHash, token)
-                    .ConfigureAwait(false);
-                stagedFile.Commit();
-                return inOrderResult;
-            }
+            return await DecodeCompleteFileCoreAsync(input, outputPath, options, computeHash, token).ConfigureAwait(false);
+    }
 
-            var decodeMode = options.ResolveParallelDecodeMode(computeHash);
-            var result = decodeMode switch
-            {
-                AscfParallelDecodeMode.OrderedWrite => await DecodeCompleteFileParallelOrderedAsync(input, stagedFile, fileHeader, chunkIndex, options, workerCount, computeHash, token).ConfigureAwait(false),
-                AscfParallelDecodeMode.RandomWrite => await DecodeCompleteFileParallelRandomWriteAsync(input, stagedFile, fileHeader, chunkIndex, options, workerCount, computeHash, token).ConfigureAwait(false),
-                _ => throw new ArgumentOutOfRangeException(nameof(options), decodeMode, "Parallel decode mode is not supported.")
-            };
+    private static async Task<DecodeFileResult> DecodeCompleteFileCoreAsync(
+        FileStream input,
+        string outputPath,
+        AscfReaderOptions options,
+        bool computeHash,
+        CancellationToken token)
+    {
+        options.Validate();
+        input.Position = 0;
+        using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
+        var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
+        var chunkIndex = await ReadChunkIndexFromEndAsync(input, fileHeader, token).ConfigureAwait(false);
+        var workerCount = options.GetParallelDecodeWorkerCount();
+        if (ShouldDecodeCompleteFileInOrder(chunkIndex, workerCount))
+        {
+            var inOrderResult = await DecodeCompleteFileInOrderAsync(input, stagedFile, fileHeader, chunkIndex, options, computeHash, token)
+                .ConfigureAwait(false);
             stagedFile.Commit();
-            return result;
+            return inOrderResult;
         }
+
+        var decodeMode = options.ResolveParallelDecodeMode(computeHash);
+        var result = decodeMode switch
+        {
+            AscfParallelDecodeMode.OrderedWrite => await DecodeCompleteFileParallelOrderedAsync(input, stagedFile, fileHeader, chunkIndex, options, workerCount, computeHash, token).ConfigureAwait(false),
+            AscfParallelDecodeMode.RandomWrite => await DecodeCompleteFileParallelRandomWriteAsync(input, stagedFile, fileHeader, chunkIndex, options, workerCount, computeHash, token).ConfigureAwait(false),
+            _ => throw new ArgumentOutOfRangeException(nameof(options), decodeMode, "Parallel decode mode is not supported.")
+        };
+        stagedFile.Commit();
+        return result;
     }
 
     private static async Task<DecodeResult> DecodeFileToRawFileParallelWithHashAsync(
@@ -676,6 +685,16 @@ public static class AscfFileReader
     {
         var result = await DecodeCompleteFileCoreAsync(inputPath, outputPath, options, computeHash: false, token)
             .ConfigureAwait(false);
+        return result.RawSize;
+    }
+
+    internal static async Task<long> DecodeFileToFileParallelAsync(
+        FileStream input,
+        string outputPath,
+        AscfReaderOptions options,
+        CancellationToken token)
+    {
+        var result = await DecodeCompleteFileCoreAsync(input, outputPath, options, computeHash: false, token).ConfigureAwait(false);
         return result.RawSize;
     }
 
@@ -784,33 +803,41 @@ public static class AscfFileReader
         CancellationToken token)
     {
         options.Validate();
-        using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
-
         var input = FileFormatStreams.OpenSequentialReadAsync(inputPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
+            return await TryWriteStoredRawWrappedLz4Async(input, outputPath, options, token).ConfigureAwait(false);
+    }
+
+    internal static async Task<WrappedLz4FileFormat.WriteResult?> TryWriteStoredRawWrappedLz4Async(
+        FileStream input,
+        string outputPath,
+        AscfReaderOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        input.Position = 0;
+        using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
+        var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
+        if (fileHeader.RawSize > int.MaxValue)
         {
-            var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
-            if (fileHeader.RawSize > int.MaxValue)
+            return null;
+        }
+
+        var wrappedRawSize = (int)fileHeader.RawSize;
+
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
+        await using (output.ConfigureAwait(false))
+        {
+            await WriteWrappedRawHeaderAsync(output, wrappedRawSize, token).ConfigureAwait(false);
+            if (!await TryCopyStoredRawChunksAsWrappedLz4Async(input, output, fileHeader, token).ConfigureAwait(false))
             {
                 return null;
             }
 
-            var wrappedRawSize = (int)fileHeader.RawSize;
-
-            var output = stagedFile.OpenSequentialWrite(options.BufferSize);
-            await using (output.ConfigureAwait(false))
-            {
-                await WriteWrappedRawHeaderAsync(output, wrappedRawSize, token).ConfigureAwait(false);
-                if (!await TryCopyStoredRawChunksAsWrappedLz4Async(input, output, fileHeader, token).ConfigureAwait(false))
-                {
-                    return null;
-                }
-
-            }
-
-            stagedFile.Commit();
-            return new WrappedLz4FileFormat.WriteResult(fileHeader.RawSize, WrappedLz4FileFormat.HeaderSize + fileHeader.RawSize);
         }
+
+        stagedFile.Commit();
+        return new WrappedLz4FileFormat.WriteResult(fileHeader.RawSize, WrappedLz4FileFormat.HeaderSize + fileHeader.RawSize);
     }
 
     private static async Task<AscfFileHeader> ReadHeaderAsync(Stream input, AscfReaderOptions options, CancellationToken token)

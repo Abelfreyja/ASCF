@@ -1128,7 +1128,7 @@ public static class AscfFileWriter
     private static Guid GetStreamId(AscfWriterOptions options)
         => options.StreamId ?? Guid.NewGuid();
 
-    private static void ValidateHashOptions(AscfWriterOptions options)
+    internal static void ValidateHashOptions(AscfWriterOptions options)
     {
         options.Validate();
         if (options.GetResultHashAlgorithms() == AscfRawHashAlgorithms.None)

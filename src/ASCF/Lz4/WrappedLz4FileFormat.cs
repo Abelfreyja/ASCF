@@ -138,38 +138,48 @@ public static class WrappedLz4FileFormat
         CancellationToken token)
     {
         options.Validate();
-        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
         var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.BufferSize);
         await using (input.ConfigureAwait(false))
+            return await ExtractToRawFileWithHashAsync(input, outputPath, algorithms, options, token).ConfigureAwait(false);
+    }
+
+    internal static async Task<FileFormatRawHashResult> ExtractToRawFileWithHashAsync(
+        FileStream input,
+        string outputPath,
+        AscfRawHashAlgorithms algorithms,
+        Lz4FormatOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        AscfRawHashAlgorithmFlags.ValidateSupported(algorithms, nameof(algorithms));
+        input.Position = 0;
+        var header = new byte[HeaderSize];
+        await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+
+        var wrappedHeader = ReadHeader(input.Length, header, options);
+
+        using var staged = FileFormatPaths.CreateStagedFile(outputPath);
+        using var hasher = AscfRawContentHasher.Create(algorithms);
+        if (CanDecodeStreamPayloadDirectly(wrappedHeader, options))
         {
-            var header = new byte[HeaderSize];
-            await input.ReadExactlyAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
-
-            var wrappedHeader = ReadHeader(input.Length, header, options);
-
-            using var staged = FileFormatPaths.CreateStagedFile(outputPath);
-            using var hasher = AscfRawContentHasher.Create(algorithms);
-            if (CanDecodeStreamPayloadDirectly(wrappedHeader, options))
-            {
-                await ExtractDirectPayloadToStagedFileAsync(input, staged, wrappedHeader, hasher, transform: null, options, token)
-                    .ConfigureAwait(false);
-            }
-            else
-            {
-                await DecodeMemoryMappedCompressedPayloadToRawFileAsync(
-                        wrappedPath,
-                        staged,
-                        wrappedHeader.InputLength,
-                        wrappedHeader.OutputLength,
-                        hasher,
-                        options,
-                        token)
-                    .ConfigureAwait(false);
-            }
-
-            staged.Commit();
-            return ToRawHashResult(hasher, wrappedHeader.OutputLength);
+            await ExtractDirectPayloadToStagedFileAsync(input, staged, wrappedHeader, hasher, transform: null, options, token)
+                .ConfigureAwait(false);
         }
+        else
+        {
+            await DecodeMemoryMappedCompressedPayloadToRawFileAsync(
+                    input,
+                    staged,
+                    wrappedHeader.InputLength,
+                    wrappedHeader.OutputLength,
+                    hasher,
+                    options,
+                    token)
+                .ConfigureAwait(false);
+        }
+
+        staged.Commit();
+        return ToRawHashResult(hasher, wrappedHeader.OutputLength);
     }
 
     public static Task<long> ExtractStreamToRawFileAsync(
@@ -737,7 +747,7 @@ public static class WrappedLz4FileFormat
     }
 
     private static async Task DecodeMemoryMappedCompressedPayloadToRawFileAsync(
-        string wrappedPath,
+        FileStream input,
         FileFormatPaths.StagedFile output,
         int inputLength,
         int outputLength,
@@ -752,7 +762,7 @@ public static class WrappedLz4FileFormat
         {
             mappedOutputStream.SetLength(outputLength);
 
-            using var inputMap = MemoryMappedFile.CreateFromFile(wrappedPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            using var inputMap = MemoryMappedFile.CreateFromFile(input, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
             using var inputView = inputMap.CreateViewAccessor(HeaderSize, inputLength, MemoryMappedFileAccess.Read);
             using var outputMap = MemoryMappedFile.CreateFromFile(mappedOutputStream, null, outputLength, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
             using var outputView = outputMap.CreateViewAccessor(0, outputLength, MemoryMappedFileAccess.ReadWrite);

@@ -36,6 +36,14 @@ public static class Lz4StreamFormat
             streamBufferSize,
             lz4Stream => AscfFileWriter.WriteStreamToFileWithHashAsync(lz4Stream, outputPath, ascfOptions, token));
 
+    internal static Task<AscfFileWriter.HashedWriteResult> ConvertToAscfFileWithHashAsync(
+        Stream compressedStream,
+        string outputPath,
+        AscfWriterOptions ascfOptions,
+        CancellationToken token)
+        => UseDecompressedStreamAsync(compressedStream,
+            lz4Stream => AscfFileWriter.WriteStreamToFileWithHashAsync(lz4Stream, outputPath, ascfOptions, token));
+
     public static Task<long> ExtractToRawFileAsync(
         string compressedPath,
         string outputPath,
@@ -52,20 +60,27 @@ public static class Lz4StreamFormat
         Lz4FormatOptions options,
         CancellationToken token)
     {
+        var input = FileFormatStreams.OpenReadAsync(compressedPath, streamBufferSize);
+        await using (input.ConfigureAwait(false))
+            return await ExtractToRawFileAsync(input, outputPath,
+                options with { BufferSize = streamBufferSize, CopyBufferSize = copyBufferSize }, token).ConfigureAwait(false);
+    }
+
+    internal static async Task<long> ExtractToRawFileAsync(
+        Stream input, string outputPath, Lz4FormatOptions options, CancellationToken token)
+    {
         options.Validate();
-        FileFormatBuffers.ValidateBufferSize(copyBufferSize, nameof(copyBufferSize));
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
 
-        var outputStream = stagedFile.OpenSequentialWrite(streamBufferSize);
+        var outputStream = stagedFile.OpenSequentialWrite(options.BufferSize);
         long rawSize;
         await using (outputStream.ConfigureAwait(false))
         {
             rawSize = await UseDecompressedStreamAsync(
-                    compressedPath,
-                    streamBufferSize,
+                    input,
                     async lz4Stream =>
                     {
-                        var buffer = ArrayPool<byte>.Shared.Rent(copyBufferSize);
+                        var buffer = ArrayPool<byte>.Shared.Rent(options.CopyBufferSize);
                         try
                         {
                             long written = 0;
@@ -186,12 +201,15 @@ public static class Lz4StreamFormat
         Func<Stream, Task<T>> action)
     {
         FileFormatBuffers.ValidateBufferSize(streamBufferSize, nameof(streamBufferSize));
-
         var compressedStream = FileFormatStreams.OpenReadAsync(compressedPath, streamBufferSize);
         await using (compressedStream.ConfigureAwait(false))
-        using (var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress, LZ4StreamFlags.HighCompression))
-        {
-            return await action(lz4Stream).ConfigureAwait(false);
-        }
+            return await UseDecompressedStreamAsync(compressedStream, action).ConfigureAwait(false);
+    }
+
+    private static async Task<T> UseDecompressedStreamAsync<T>(Stream compressedStream, Func<Stream, Task<T>> action)
+    {
+        using var lz4Stream = new LZ4Stream(compressedStream, LZ4StreamMode.Decompress,
+            LZ4StreamFlags.HighCompression | LZ4StreamFlags.IsolateInnerStream);
+        return await action(lz4Stream).ConfigureAwait(false);
     }
 }

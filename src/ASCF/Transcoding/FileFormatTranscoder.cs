@@ -63,12 +63,33 @@ public static class FileFormatTranscoder
         CancellationToken token)
     {
         options.Validate();
-        if (await AscfFileReader.TryWriteStoredRawWrappedLz4Async(ascfPath, wrappedTempPath, options.AscfReader, token).ConfigureAwait(false) is { } storedRaw)
+        var input = FileFormatStreams.OpenRandomReadAsync(ascfPath, options.AscfReader.BufferSize);
+        await using (input.ConfigureAwait(false))
+            return await ConvertAscfFileToWrappedLz4Async(input, rawTempPath, wrappedTempPath, options, token).ConfigureAwait(false);
+    }
+
+    public static Task<WrappedLz4FileFormat.WriteResult> ConvertAscfFileToWrappedLz4Async(
+        FileStream input,
+        string wrappedPath,
+        FileFormatTranscodeOptions options,
+        CancellationToken token)
+        => RunWithRawTempFileAsync(wrappedPath,
+            rawPath => ConvertAscfFileToWrappedLz4Async(input, rawPath, wrappedPath, options, token));
+
+    private static async Task<WrappedLz4FileFormat.WriteResult> ConvertAscfFileToWrappedLz4Async(
+        FileStream input,
+        string rawTempPath,
+        string wrappedTempPath,
+        FileFormatTranscodeOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        if (await AscfFileReader.TryWriteStoredRawWrappedLz4Async(input, wrappedTempPath, options.AscfReader, token).ConfigureAwait(false) is { } storedRaw)
         {
             return storedRaw;
         }
 
-        var rawSize = await AscfFileReader.DecodeFileToFileParallelAsync(ascfPath, rawTempPath, options.AscfReader, token)
+        var rawSize = await AscfFileReader.DecodeFileToFileParallelAsync(input, rawTempPath, options.AscfReader, token)
             .ConfigureAwait(false);
         var wrapped = await WrappedLz4FileFormat.WriteFromRawFileAsync(rawTempPath, wrappedTempPath, options.Lz4, token)
             .ConfigureAwait(false);
@@ -79,6 +100,21 @@ public static class FileFormatTranscoder
 
         return wrapped;
     }
+
+    public static Task<WrappedLz4FileFormat.WriteResult> ConvertLz4StreamToWrappedLz4Async(
+        FileStream input,
+        string wrappedPath,
+        FileFormatTranscodeOptions options,
+        CancellationToken token)
+        => RunWithRawTempFileAsync(wrappedPath, async rawPath =>
+        {
+            options.Validate();
+            input.Position = 0;
+            var rawSize = await Lz4StreamFormat.ExtractToRawFileAsync(input, rawPath, options.Lz4, token).ConfigureAwait(false);
+            var result = await WrappedLz4FileFormat.WriteFromRawFileAsync(rawPath, wrappedPath, options.Lz4, token).ConfigureAwait(false);
+            ValidateConvertedRawSize(rawSize, result.OriginalSize);
+            return result;
+        });
 
     public static Task<ConvertResult> ConvertWrappedLz4ToAscfAsync(
         string wrappedPath,
@@ -114,31 +150,17 @@ public static class FileFormatTranscoder
         CancellationToken token)
     {
         options.Validate();
-        var header = TryReadWrappedHeader(wrappedPath, options.Lz4);
-        if (header is { } storedRawHeader
-            && Lz4BlockCodec.IsStoredRaw(storedRawHeader.OutputLength, storedRawHeader.InputLength))
+        if (options.AscfWriter.ResultHashAlgorithms != AscfRawHashAlgorithms.None)
+            options = options with { AscfWriter = options.AscfWriter with { ResultHashAlgorithms = AscfRawHashAlgorithms.None } };
+        var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.Lz4.BufferSize);
+        await using (input.ConfigureAwait(false))
         {
-            var storedRawSize = await AscfFileWriter
-                .WriteStoredRawFileAsync(wrappedPath, WrappedLz4FileFormat.HeaderSize, storedRawHeader.OutputLength, ascfTempPath, options.AscfWriter, token)
+            var header = await TryReadWrappedHeaderAsync(input, options.Lz4, token).ConfigureAwait(false)
+                ?? throw new InvalidDataException("Wrapped LZ4 header is invalid.");
+            var result = await ConvertWrappedLz4ToAscfAsync(input, header, rawTempPath, ascfTempPath, options, token)
                 .ConfigureAwait(false);
-            return new ConvertResult(storedRawHeader.OutputLength, storedRawSize);
-        }
-
-        if (header is { } wrappedHeader
-            && ShouldDecodeWrappedPayloadInMemory(wrappedHeader, options))
-        {
-            var raw = await DecodeWrappedPayloadToArrayAsync(wrappedPath, wrappedHeader, options.Lz4, token).ConfigureAwait(false);
-            using var rawStream = new MemoryStream(raw, writable: false);
-            var result = await AscfFileWriter.WriteStreamToFileAsync(rawStream, ascfTempPath, options.AscfWriter, token)
-                .ConfigureAwait(false);
-            ValidateConvertedRawSize(wrappedHeader.OutputLength, result.RawSize);
             return new ConvertResult(result.RawSize, result.StoredSize);
         }
-
-        var rawSize = await WrappedLz4FileFormat.ExtractToRawFileAsync(wrappedPath, rawTempPath, options.Lz4, token)
-            .ConfigureAwait(false);
-        var storedSize = await AscfFileWriter.WriteFileAsync(rawTempPath, ascfTempPath, options.AscfWriter, token).ConfigureAwait(false);
-        return new ConvertResult(rawSize, storedSize);
     }
 
     public static Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
@@ -174,14 +196,36 @@ public static class FileFormatTranscoder
         CancellationToken token)
     {
         options.Validate();
-        if (await WrappedLz4FileFormat.TryReadHeaderAsync(lz4Path, lz4Length, streamBufferSize, options.Lz4, token).ConfigureAwait(false) is { } header)
+        var input = FileFormatStreams.OpenReadAsync(lz4Path, streamBufferSize);
+        await using (input.ConfigureAwait(false))
+            return await ConvertLz4PayloadToAscfWithHashAsync(input, rawTempPath, ascfTempPath, options, token).ConfigureAwait(false);
+    }
+
+    public static Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
+        FileStream input,
+        string ascfPath,
+        FileFormatTranscodeOptions options,
+        CancellationToken token)
+        => RunWithRawTempFileAsync(ascfPath,
+            rawPath => ConvertLz4PayloadToAscfWithHashAsync(input, rawPath, ascfPath, options, token));
+
+    private static async Task<ConvertHashResult> ConvertLz4PayloadToAscfWithHashAsync(
+        FileStream input,
+        string rawTempPath,
+        string ascfTempPath,
+        FileFormatTranscodeOptions options,
+        CancellationToken token)
+    {
+        options.Validate();
+        AscfFileWriter.ValidateHashOptions(options.AscfWriter);
+        if (await TryReadWrappedHeaderAsync(input, options.Lz4, token).ConfigureAwait(false) is { } header)
         {
-            var wrapped = await ConvertWrappedLz4ToAscfWithHashAsync(lz4Path, header, rawTempPath, ascfTempPath, options, token)
+            var wrapped = await ConvertWrappedLz4ToAscfAsync(input, header, rawTempPath, ascfTempPath, options, token)
                 .ConfigureAwait(false);
             return new ConvertHashResult(wrapped.Hashes, wrapped.RawSize, wrapped.StoredSize, Lz4PayloadFormat.WrappedLz4);
         }
 
-        var stream = await ConvertLz4StreamToAscfWithHashAsync(lz4Path, ascfTempPath, streamBufferSize, options, token)
+        var stream = await Lz4StreamFormat.ConvertToAscfFileWithHashAsync(input, ascfTempPath, options.AscfWriter, token)
             .ConfigureAwait(false);
         return new ConvertHashResult(stream.Hashes, stream.RawSize, stream.StoredSize, Lz4PayloadFormat.Lz4Stream);
     }
@@ -213,10 +257,16 @@ public static class FileFormatTranscoder
         CancellationToken token)
     {
         options.Validate();
-        var header = ReadWrappedHeader(wrappedPath, options.Lz4);
-        var result = await ConvertWrappedLz4ToAscfWithHashAsync(wrappedPath, header, rawTempPath, ascfTempPath, options, token)
-            .ConfigureAwait(false);
-        return new ConvertHashResult(result.Hashes, result.RawSize, result.StoredSize, Lz4PayloadFormat.WrappedLz4);
+        AscfFileWriter.ValidateHashOptions(options.AscfWriter);
+        var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.Lz4.BufferSize);
+        await using (input.ConfigureAwait(false))
+        {
+            var header = await TryReadWrappedHeaderAsync(input, options.Lz4, token).ConfigureAwait(false)
+                ?? throw new InvalidDataException("Wrapped LZ4 header is invalid.");
+            var result = await ConvertWrappedLz4ToAscfAsync(input, header, rawTempPath, ascfTempPath, options, token)
+                .ConfigureAwait(false);
+            return new ConvertHashResult(result.Hashes, result.RawSize, result.StoredSize, Lz4PayloadFormat.WrappedLz4);
+        }
     }
 
     public static async Task<ConvertHashResult> ConvertLz4StreamToAscfWithHashAsync(
@@ -252,38 +302,50 @@ public static class FileFormatTranscoder
         return new ConvertResult(result.RawSize, result.StoredSize);
     }
 
-    private static async Task<AscfFileWriter.HashedWriteResult> ConvertWrappedLz4ToAscfWithHashAsync(
-        string wrappedPath,
+    private static async Task<AscfFileWriter.HashedWriteResult> ConvertWrappedLz4ToAscfAsync(
+        FileStream input,
         WrappedLz4FileFormat.Header header,
         string rawTempPath,
         string ascfTempPath,
         FileFormatTranscodeOptions options,
         CancellationToken token)
     {
+        var computeHashes = options.AscfWriter.ResultHashAlgorithms != AscfRawHashAlgorithms.None;
         if (Lz4BlockCodec.IsStoredRaw(header.OutputLength, header.InputLength))
         {
-            return await AscfFileWriter
-                .WriteStoredRawFileWithHashAsync(wrappedPath, WrappedLz4FileFormat.HeaderSize, header.OutputLength, ascfTempPath, options.AscfWriter, token)
+            input.Position = WrappedLz4FileFormat.HeaderSize;
+            if (computeHashes)
+                return await AscfFileWriter.WriteStoredRawStreamToFileWithHashAsync(input, header.OutputLength, ascfTempPath, options.AscfWriter, token)
+                    .ConfigureAwait(false);
+            var storedSize = await AscfFileWriter.WriteStoredRawStreamToFileAsync(input, header.OutputLength, ascfTempPath, options.AscfWriter, token)
                 .ConfigureAwait(false);
+            return new AscfFileWriter.HashedWriteResult(default, header.OutputLength, storedSize);
         }
 
         if (ShouldDecodeWrappedPayloadInMemory(header, options))
         {
-            var raw = await DecodeWrappedPayloadToArrayAsync(wrappedPath, header, options.Lz4, token).ConfigureAwait(false);
+            var raw = await DecodeWrappedPayloadToArrayAsync(input, header, token).ConfigureAwait(false);
             using var rawStream = new MemoryStream(raw, writable: false);
-            var streamResult = await AscfFileWriter.WriteStreamToFileWithHashAsync(rawStream, ascfTempPath, options.AscfWriter, token)
+            if (computeHashes)
+                return await AscfFileWriter.WriteStreamToFileWithHashAsync(rawStream, ascfTempPath, options.AscfWriter, token)
+                    .ConfigureAwait(false);
+            var result = await AscfFileWriter.WriteStreamToFileAsync(rawStream, ascfTempPath, options.AscfWriter, token)
                 .ConfigureAwait(false);
-            ValidateConvertedRawSize(header.OutputLength, streamResult.RawSize);
-            return streamResult;
+            return new AscfFileWriter.HashedWriteResult(default, result.RawSize, result.StoredSize);
         }
 
-        var rawSize = await WrappedLz4FileFormat.ExtractToRawFileAsync(wrappedPath, rawTempPath, options.Lz4, token)
+        var extracted = await WrappedLz4FileFormat.ExtractToRawFileWithHashAsync(input, rawTempPath, AscfRawHashAlgorithms.None, options.Lz4, token)
             .ConfigureAwait(false);
-        var fileResult = await AscfFileWriter.WriteFileWithHashAsync(rawTempPath, ascfTempPath, options.AscfWriter, token)
-            .ConfigureAwait(false);
-        ValidateConvertedRawSize(rawSize, fileResult.RawSize);
+        if (computeHashes)
+        {
+            var result = await AscfFileWriter.WriteFileWithHashAsync(rawTempPath, ascfTempPath, options.AscfWriter, token)
+                .ConfigureAwait(false);
+            ValidateConvertedRawSize(extracted.RawSize, result.RawSize);
+            return result;
+        }
 
-        return fileResult;
+        var storedFileSize = await AscfFileWriter.WriteFileAsync(rawTempPath, ascfTempPath, options.AscfWriter, token).ConfigureAwait(false);
+        return new AscfFileWriter.HashedWriteResult(default, extracted.RawSize, storedFileSize);
     }
 
     private static bool ShouldDecodeWrappedPayloadInMemory(WrappedLz4FileFormat.Header header, FileFormatTranscodeOptions options)
@@ -303,51 +365,39 @@ public static class FileFormatTranscoder
         }
     }
 
-    private static WrappedLz4FileFormat.Header ReadWrappedHeader(string wrappedPath, Lz4FormatOptions options)
-    {
-        if (TryReadWrappedHeader(wrappedPath, options) is { } header)
-        {
-            return header;
-        }
-
-        if (!File.Exists(wrappedPath))
-        {
-            throw new FileNotFoundException($"No wrapped LZ4 source found at {wrappedPath}.", wrappedPath);
-        }
-
-        throw new InvalidDataException("Wrapped LZ4 header is invalid.");
-    }
-
-    private static WrappedLz4FileFormat.Header? TryReadWrappedHeader(string wrappedPath, Lz4FormatOptions options)
-    {
-        var wrappedInfo = new FileInfo(wrappedPath);
-        return wrappedInfo.Exists
-            ? WrappedLz4FileFormat.TryReadHeader(wrappedPath, wrappedInfo.Length, options.BufferSize, options)
-            : null;
-    }
-
     private static async Task<byte[]> DecodeWrappedPayloadToArrayAsync(
-        string wrappedPath,
+        FileStream input,
         WrappedLz4FileFormat.Header header,
-        Lz4FormatOptions options,
         CancellationToken token)
     {
-        var input = FileFormatStreams.OpenReadAsync(wrappedPath, options.BufferSize);
-        await using (input.ConfigureAwait(false))
+        input.Position = WrappedLz4FileFormat.HeaderSize;
+        var stored = ArrayPool<byte>.Shared.Rent(header.InputLength);
+        try
         {
-            input.Position = WrappedLz4FileFormat.HeaderSize;
-            var stored = ArrayPool<byte>.Shared.Rent(header.InputLength);
-            try
-            {
-                await input.ReadExactlyAsync(stored.AsMemory(0, header.InputLength), token).ConfigureAwait(false);
-                var raw = GC.AllocateUninitializedArray<byte>(header.OutputLength);
-                Lz4BlockCodec.Decode(stored.AsSpan(0, header.InputLength), raw, header.OutputLength);
-                return raw;
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(stored);
-            }
+            await input.ReadExactlyAsync(stored.AsMemory(0, header.InputLength), token).ConfigureAwait(false);
+            var raw = GC.AllocateUninitializedArray<byte>(header.OutputLength);
+            Lz4BlockCodec.Decode(stored.AsSpan(0, header.InputLength), raw, header.OutputLength);
+            return raw;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(stored);
+        }
+    }
+
+    private static async Task<WrappedLz4FileFormat.Header?> TryReadWrappedHeaderAsync(
+        FileStream input, Lz4FormatOptions options, CancellationToken token)
+    {
+        input.Position = 0;
+        var header = new byte[WrappedLz4FileFormat.HeaderSize];
+        try
+        {
+            var read = await FileFormatStreamReader.ReadUpToAsync(input, header, token).ConfigureAwait(false);
+            return read == header.Length ? WrappedLz4FileFormat.TryReadHeader(input.Length, header, options) : null;
+        }
+        finally
+        {
+            input.Position = 0;
         }
     }
 
