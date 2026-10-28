@@ -1073,7 +1073,7 @@ public static class AscfFileWriter
         WriteOptions options,
         CancellationToken token)
     {
-        var pageSize = checked(AscfFileFormat.IndexEntrySize * FileFormatBuffers.IndexEntriesPerPage);
+        var pageSize = FileFormatBuffers.GetIndexPageByteCount(entries.Count);
         var page = ArrayPool<byte>.Shared.Rent(pageSize);
         var indexChecksum = AscfChecksum.CreateIncrementalXxHash3();
         try
