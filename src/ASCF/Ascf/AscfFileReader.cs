@@ -191,13 +191,21 @@ public static class AscfFileReader
         options.Validate();
         var input = FileFormatStreams.OpenSequentialReadAsync(path, options.BufferSize);
         await using (input.ConfigureAwait(false))
-        {
-            var fileHeader = await ReadHeaderAsync(input, options, token).ConfigureAwait(false);
-            var metadata = ToMetadata(fileHeader, input.Length);
-            var position = await ReadResumePositionFromEndAsync(input, fileHeader, metadata, encodedBytes, token)
-                .ConfigureAwait(false);
-            return new AscfResumeInfo(metadata, position);
-        }
+            return await ReadResumeInfoAsync(input, encodedBytes, options, token).ConfigureAwait(false);
+    }
+
+    public static async Task<AscfResumeInfo> ReadResumeInfoAsync(
+        FileStream input, long encodedBytes, AscfReaderOptions options, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        options.Validate();
+        var header = new byte[AscfFileFormat.HeaderSize];
+        await ReadExactlyAtAsync(input.SafeFileHandle, header, 0, token).ConfigureAwait(false);
+        var fileHeader = ValidateHeader(header, options, input.Length);
+        var metadata = ToMetadata(fileHeader, input.Length);
+        var position = await ReadResumePositionFromEndAsync(input, fileHeader, metadata, encodedBytes, token)
+            .ConfigureAwait(false);
+        return new AscfResumeInfo(metadata, position);
     }
 
     /// <summary> reads the chunk index from a complete file </summary>
@@ -441,8 +449,31 @@ public static class AscfFileReader
     {
         ValidateHashResultOptions(options);
         using var stagedFile = FileFormatPaths.CreateStagedFile(outputPath);
-        StoredStreamResult storedResult;
+        StoredStreamResult result;
+        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
+        await using (output.ConfigureAwait(false))
+            result = await ValidateStoredStreamAsync(encodedStream, output, copyPayload: true, transform, options, token)
+                .ConfigureAwait(false);
+        stagedFile.Commit();
+        return result;
+    }
 
+    public static async Task<StoredStreamResult> FinalizeEncodedFileAsync(
+        string path, AscfReaderOptions options, CancellationToken token)
+    {
+        ValidateHashResultOptions(options);
+        token.ThrowIfCancellationRequested();
+        var file = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None,
+            options.BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using (file.ConfigureAwait(false))
+            return await ValidateStoredStreamAsync(file, file, copyPayload: false, transform: null, options, token)
+                .ConfigureAwait(false);
+    }
+
+    private static async Task<StoredStreamResult> ValidateStoredStreamAsync(
+        Stream encodedStream, FileStream output, bool copyPayload,
+        AscfBufferTransform? transform, AscfReaderOptions options, CancellationToken token)
+    {
         var header = new byte[AscfFileFormat.HeaderSize];
         var encodedStartPosition = encodedStream.CanSeek ? encodedStream.Position : 0;
         await ReadTransformedBytesAsync(encodedStream, header.AsMemory(0, header.Length), transform, token).ConfigureAwait(false);
@@ -451,58 +482,51 @@ public static class AscfFileReader
             options,
             encodedStream.CanSeek ? encodedStream.Length - encodedStartPosition : null);
 
-        var output = stagedFile.OpenSequentialWrite(options.BufferSize);
-        await using (output.ConfigureAwait(false))
+        using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
+        if (copyPayload) await output.WriteAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+
+        var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
+        var maxStoredPayloadSize = fileHeader.RawChunkSize;
+        var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
+        var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
+        try
         {
-            using var hasher = CreateRawHasher(GetHashAlgorithms(fileHeader, options));
-            await output.WriteAsync(header.AsMemory(0, header.Length), token).ConfigureAwait(false);
+            var decoded = await DecodeChunksAsync(
+                    encodedStream,
+                    copyPayload ? output : Stream.Null,
+                    hasher,
+                    fileHeader,
+                    chunkHeader,
+                    compressedBuffer,
+                    rawBuffer,
+                    transform,
+                    writeWirePayload: true,
+                    token: token)
+                .ConfigureAwait(false);
+            await ReadAndValidateIndexAsync(encodedStream, copyPayload ? output : Stream.Null, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: true, token: token)
+                .ConfigureAwait(false);
 
-            var chunkHeader = new byte[AscfFileFormat.ChunkHeaderSize];
-            var maxStoredPayloadSize = fileHeader.RawChunkSize;
-            var compressedBuffer = ArrayPool<byte>.Shared.Rent(maxStoredPayloadSize);
-            var rawBuffer = ArrayPool<byte>.Shared.Rent(fileHeader.RawChunkSize);
-            try
+            if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
             {
-                var decoded = await DecodeChunksAsync(
-                        encodedStream,
-                        output,
-                        hasher,
-                        fileHeader,
-                        chunkHeader,
-                        compressedBuffer,
-                        rawBuffer,
-                        transform,
-                        writeWirePayload: true,
-                        token: token)
-                    .ConfigureAwait(false);
-                await ReadAndValidateIndexAsync(encodedStream, output, decoded.Entries, decoded.RawSize, decoded.EncodedOffset, transform, writeWirePayload: true, token: token)
-                    .ConfigureAwait(false);
-
-                if (await HasTrailingByteAsync(encodedStream, transform, token).ConfigureAwait(false))
-                {
-                    throw new InvalidDataException(".ascf stream contained trailing bytes.");
-                }
-
-                var hashes = FinalizeHashes(fileHeader, hasher);
-                var storedHashes = fileHeader.RawHashes.Merge(hashes);
-                await RewriteStoredHeaderAsync(
-                        output,
-                        fileHeader,
-                        output.Length,
-                        storedHashes,
-                        token)
-                    .ConfigureAwait(false);
-                storedResult = new StoredStreamResult(GetResultHashes(hashes, options), storedHashes.ToPublic(), decoded.RawSize, output.Length);
+                throw new InvalidDataException(".ascf stream contained trailing bytes.");
             }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(rawBuffer);
-                ArrayPool<byte>.Shared.Return(compressedBuffer);
-            }
+
+            var hashes = FinalizeHashes(fileHeader, hasher);
+            var storedHashes = fileHeader.RawHashes.Merge(hashes);
+            await RewriteStoredHeaderAsync(
+                    output,
+                    fileHeader,
+                    output.Length,
+                    storedHashes,
+                    token)
+                .ConfigureAwait(false);
+            return new StoredStreamResult(GetResultHashes(hashes, options), storedHashes.ToPublic(), decoded.RawSize, output.Length);
         }
-
-        stagedFile.Commit();
-        return storedResult;
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rawBuffer);
+            ArrayPool<byte>.Shared.Return(compressedBuffer);
+        }
     }
 
     public static Task<DecodeResult> DecodeFileToRawFileAsync(
@@ -2709,6 +2733,9 @@ public static class AscfFileReader
 
     private static async Task<bool> HasTrailingByteAsync(Stream stream, AscfBufferTransform? transform, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
+        if (stream.CanSeek) return stream.Position != stream.Length;
+
         var buffer = new byte[1];
         var read = await stream.ReadAsync(buffer.AsMemory(0, 1), token).ConfigureAwait(false);
         if (read <= 0)
