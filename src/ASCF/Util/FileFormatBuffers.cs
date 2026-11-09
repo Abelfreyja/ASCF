@@ -6,6 +6,9 @@ public static class FileFormatBuffers
     internal const int IndexEntriesPerPage = 1024;
     internal const int IndexDirectReadThreshold = 512;
 
+    internal static int GetIndexPageByteCount(int entryCount)
+        => checked(Math.Min(entryCount, IndexEntriesPerPage) * AscfFileFormat.IndexEntrySize);
+
     internal static void ValidateBufferSize(int bufferSize, string parameterName)
     {
         if (bufferSize <= 0)
